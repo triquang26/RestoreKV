@@ -109,6 +109,7 @@ class PartitionedRestoreKVPress(RestoreKVPress):
     transport_iters: int = 2
     transport_tau: float = 0.1
     transport_lambda_v: float = 1.0
+    transport_mass_scale: float = 1.0  # beta in logit + beta*log(mass); 1 = exact conserving memory, 0 = ablation
     query_moment: str | None = None  # safetensors file with G (L, H_kv, d, d); None -> identity
     selection_only: bool = False
     drop_slots_at_decode: bool = False  # diagnostics only: evict the restore slots again after building them
@@ -189,6 +190,7 @@ class PartitionedRestoreKVPress(RestoreKVPress):
                 self.transport_config,
             )
             keys[:, T : T + n], values[:, T : T + n] = mu, nu
+            log_mass = torch.where(torch.isinf(log_mass), log_mass, self.transport_mass_scale * log_mass)
             layer.self_attn.prgf_slot_bias = (T, log_mass)
 
     def _mask_restore_slots(self, model: PreTrainedModel):
