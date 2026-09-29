@@ -90,7 +90,9 @@ def build_data(n_longalpaca: int = 1200, n_pg19: int = 1000, n_flan: int = 500, 
 def train_remote(cfg: dict):
     from prgf.train import TrainConfig, Trainer
 
-    Trainer(TrainConfig(**cfg)).train(on_save=runs.commit)
+    trainer = Trainer(TrainConfig(**cfg))
+    hf_cache.commit()
+    trainer.train(on_save=runs.commit)
     runs.commit()
 
 
@@ -123,6 +125,7 @@ class Evaluator:
             "kv-press-text-generation", model=MODEL, device="cuda:0", dtype=torch.bfloat16,
             model_kwargs={"attn_implementation": "sdpa"},
         )
+        hf_cache.commit()  # keep downloaded weights for the next containers
         self.data = {}
 
     @modal.method()
