@@ -10,6 +10,7 @@ Protocol (identical for every method):
 """
 
 import ast
+import contextlib
 import time
 
 import numpy as np
@@ -82,22 +83,49 @@ def score(df: pd.DataFrame) -> dict:
     return {"average": round(float(np.mean(list(per_task.values()))), 2), "per_task": per_task, "n": len(df)}
 
 
-def compression_latency(pipe, press, contexts: list[str], warmup: int = 2) -> dict:
-    """Wall time of the one-time cache construction (prefill + scoring + restore pass), per context."""
+def profile(pipe, press, df: pd.DataFrame, warmup: int = 2) -> dict:
+    """Per-sample wall time split into prefill, compression (scoring + restore pass) and decoding.
+
+    Mirrors KVPressTextGenerationPipeline._forward for one question per context.
+    """
     import torch
+    from kvpress import RestoreKVPress
     from transformers import DynamicCache
 
     from prgf.press import prepare_press
 
-    model, times = pipe.model, []
+    model = pipe.model
     prepare_press(press, model)
-    for i, context in enumerate(contexts):
-        ids = pipe.preprocess(context, [""], "", 10**9)["context_ids"].to(model.device)
+    rows = {"prefill_s": [], "compress_s": [], "decode_s": [], "new_tokens": []}
+
+    def timed(fn):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        with torch.inference_mode(), press(model):
-            model.model(input_ids=ids, past_key_values=DynamicCache())
+        out = fn()
         torch.cuda.synchronize()
-        if i >= warmup:
-            times.append(time.perf_counter() - t0)
-    return {"mean_s": float(np.mean(times)), "std_s": float(np.std(times)), "n": len(times)}
+        return out, time.perf_counter() - t0
+
+    with torch.inference_mode():
+        for i, (_, row) in enumerate(df.iterrows()):
+            inputs = pipe.preprocess(row["context"], [row["question"]], row["answer_prefix"], 10**9)
+            ctx = inputs["context_ids"].to(model.device)
+            _, prefill = timed(lambda: model.model(input_ids=ctx, past_key_values=DynamicCache()))
+            cache = DynamicCache()
+
+            def compress():
+                with press(model) if press is not None else contextlib.nullcontext():
+                    model.model(input_ids=ctx, past_key_values=cache)
+
+            _, total = timed(compress)
+            length = cache.get_seq_length() if isinstance(press, RestoreKVPress) else ctx.shape[1]
+            answer, decode = timed(lambda: pipe.generate_answer(
+                inputs["questions_ids"][0].to(model.device), cache, length, int(row["max_new_tokens"])))
+            if i >= warmup:
+                rows["prefill_s"].append(prefill)
+                rows["compress_s"].append(total - prefill)
+                rows["decode_s"].append(decode)
+                rows["new_tokens"].append(len(pipe.tokenizer.encode(answer)))
+    out = {k: float(np.mean(v)) for k, v in rows.items()}
+    out["decode_ms_per_token"] = 1000 * out["decode_s"] / max(out["new_tokens"], 1)
+    out["n"] = len(rows["prefill_s"])
+    return out

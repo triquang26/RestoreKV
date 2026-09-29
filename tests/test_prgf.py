@@ -134,3 +134,12 @@ def test_press_end_to_end_budget(model, adapter_dir, mode):
     budget = n_layers * n_heads * ctx_len * (1 - 0.75)
     # kept context + restore slots == budget (up to integer rounding)
     assert abs(kept + N_RESTORE * n_layers * n_heads - budget) <= 1
+
+
+def test_cached_tokenizer_is_reused():
+    import kvpress.presses.kvzip_press as kz
+
+    from prgf import speedups
+
+    speedups.enable()
+    assert kz.AutoTokenizer.from_pretrained(TOKENIZER) is kz.AutoTokenizer.from_pretrained(TOKENIZER)

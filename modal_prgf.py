@@ -88,8 +88,10 @@ def build_data(n_longalpaca: int = 1200, n_pg19: int = 1000, n_flan: int = 500, 
 # ----------------------------------------------------------------------------- training
 @app.function(image=kv_image, gpu="A100-80GB", volumes=volumes, timeout=24 * 3600, max_containers=2)
 def train_remote(cfg: dict):
+    from prgf import speedups
     from prgf.train import TrainConfig, Trainer
 
+    speedups.enable()
     Trainer(TrainConfig(**cfg)).train(on_save=runs.commit)
     runs.commit()
 
@@ -112,6 +114,9 @@ class Evaluator:
         from transformers import pipeline
 
         import prgf.press  # noqa: F401  (installs the masked-SDPA hook before the model runs)
+        from prgf import speedups
+
+        speedups.enable()
 
         self.pipe = pipeline(
             "kv-press-text-generation", model=MODEL, device="cuda:0", dtype=torch.bfloat16,
@@ -133,12 +138,12 @@ class Evaluator:
 
 
     @modal.method()
-    def latency(self, specs: dict, ratio: float, n_contexts: int) -> dict:
-        from prgf.evaluate import compression_latency, load_ruler, make_press
+    def profile(self, specs: dict, ratio: float, n_samples: int) -> dict:
+        from prgf.evaluate import load_ruler, make_press, profile
 
         runs.reload()
-        contexts = list(load_ruler("dev")["context"].unique()[:n_contexts])
-        return {name: compression_latency(self.pipe, make_press(spec, ratio), contexts) for name, spec in specs.items()}
+        df = load_ruler("dev").groupby("task").head(max(1, n_samples // 13))
+        return {name: profile(self.pipe, make_press(spec, ratio), df) for name, spec in specs.items()}
 
 
 @app.function(image=kv_image, volumes=volumes, timeout=12 * 3600)
@@ -199,10 +204,11 @@ def report(split: str = "dev"):
 
 
 @app.local_entrypoint()
-def latency(specs: str, ratio: float = 0.9, n_contexts: int = 22):
-    """specs: JSON {name: spec}; all measured sequentially on the same GPU."""
-    for name, r in Evaluator().latency.remote(json.loads(specs), ratio, n_contexts).items():
-        print(f"{name:<20} {1000 * r['mean_s']:.1f} ± {1000 * r['std_s']:.1f} ms / context (n={r['n']})")
+def profile(specs: str, ratio: float = 0.9, n_samples: int = 39):
+    """specs: JSON {name: spec}; measured sequentially on one GPU, stratified over RULER tasks."""
+    for name, r in Evaluator().profile.remote(json.loads(specs), ratio, n_samples).items():
+        print(f"{name:<16} prefill {r['prefill_s'] * 1e3:7.1f} ms | compress {r['compress_s'] * 1e3:7.1f} ms | "
+              f"decode {r['decode_s'] * 1e3:7.1f} ms ({r['new_tokens']:.1f} tok, {r['decode_ms_per_token']:.1f} ms/tok) | n={r['n']}")
 
 
 # ----------------------------------------------------------------------------- smoke test
@@ -212,8 +218,11 @@ def smoke_remote(adapter: str | None = None):
     import torch
     from transformers import pipeline
 
+    from prgf import speedups
     from prgf.evaluate import make_press
     from prgf.press import prepare_press
+
+    speedups.enable()
 
     pipe = pipeline(
         "kv-press-text-generation", model=MODEL, device="cuda:0", dtype=torch.bfloat16,
