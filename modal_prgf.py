@@ -291,3 +291,29 @@ def profile_train_remote(mask_mode: str, steps: int):
 @app.local_entrypoint()
 def profile_train(mask_mode: str = "prgf", steps: int = 5):
     profile_train_remote.remote(mask_mode, steps)
+
+
+# ----------------------------------------------------------------------------- diagnostics
+@app.function(image=kv_image, gpu="A100", volumes=volumes, timeout=3600)
+def diagnose_remote(ratio: float, tasks: list[str], per_task: int) -> dict:
+    import torch
+    from transformers import pipeline
+
+    from prgf import speedups
+    from prgf.diagnostics import eviction_profile
+    from prgf.evaluate import load_ruler
+
+    speedups.enable()
+    pipe = pipeline("kv-press-text-generation", model=MODEL, device="cuda:0", dtype=torch.bfloat16,
+                    model_kwargs={"attn_implementation": "sdpa"})
+    df = load_ruler("test:50")
+    df = df[df["task"].isin(tasks)].groupby("task").head(per_task)
+    return eviction_profile(pipe, df, ratio)
+
+
+@app.local_entrypoint()
+def diagnose(ratio: float = 0.9375, tasks: str = "niah_single_2,niah_multivalue,cwe", per_task: int = 20, out: str = "diagnose.json"):
+    res = diagnose_remote.remote(ratio, tasks.split(","), per_task)
+    with open(out, "w") as f:
+        json.dump(res, f)
+    print(f"wrote {out}")

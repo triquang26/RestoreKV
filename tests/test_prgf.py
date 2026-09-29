@@ -182,3 +182,18 @@ def test_exchange_lets_locals_see_other_regions_through_global(model):
     base, _ = _restore_pass(model, cache, emb, provider)
     out, _ = _restore_pass(model, perturbed, emb, provider)
     assert ((out - base).abs().amax(-1) > 1e-6).all()  # every local slot now receives region-3 info via G
+
+
+def test_eviction_profile_runs(model, adapter_dir):
+    import pandas as pd
+
+    from prgf.diagnostics import eviction_profile
+
+    tok = AutoTokenizer.from_pretrained(TOKENIZER)
+    pipe = pipeline("kv-press-text-generation", model=model, tokenizer=tok, device="cpu")
+    context = " ".join(f"word{i}" for i in range(120)) + " The code is 4242. " + " ".join(f"tail{i}" for i in range(60))
+    df = pd.DataFrame([{"context": context, "task": "niah_single_2", "answer": ["4242"]}])
+    out = eviction_profile(pipe, df, 0.75, adapter=adapter_dir)
+    regions = [r for r in out["regions"] if isinstance(r["region"], int)]
+    assert len(regions) == 7 and all(0 <= r["kept"] <= 1 for r in regions)
+    assert len(out["values"]) == 1 and 0 < out["values"][0]["depth"] < 1
