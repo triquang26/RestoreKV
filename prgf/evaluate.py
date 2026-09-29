@@ -3,7 +3,8 @@
 Protocol (identical for every method):
   * dataset ``simonjegou/ruler`` / 4096, the one used by the KVPress leaderboard;
   * fixed split: ``dev`` = first ``DEV_PER_TASK`` rows of each task after a seeded shuffle (used for
-    iterating), ``test`` = the remaining rows (only used for final numbers), ``all`` = everything;
+    iterating), ``test`` = the remaining rows (only used for final numbers), ``test:K`` = the first K
+    test rows of each task (same shuffle; a cheaper held-out set), ``all`` = everything;
   * rows grouped by context and answered by ``pipe(context, questions=..., answer_prefix=...)`` exactly as
     kvpress/evaluation/evaluate.py does; greedy decoding with the task's max_new_tokens;
   * SDPA attention and bf16 for all methods; score = kvpress' RULER string-match metric, averaged over tasks.
@@ -28,12 +29,14 @@ def load_ruler(split: str) -> pd.DataFrame:
     df["max_new_tokens"] = df["max_new_tokens"].astype(int)
     if split == "all":
         return df
+    split, _, per_task = split.partition(":")
     rng = np.random.default_rng(SPLIT_SEED)
-    dev_idx = []
+    dev_idx, test_idx = [], []
     for _, g in df.groupby("task", sort=True):
-        dev_idx += list(rng.permutation(g.index.to_numpy())[:DEV_PER_TASK])
-    dev = df.index.isin(dev_idx)
-    return df[dev] if split == "dev" else df[~dev]
+        order = rng.permutation(g.index.to_numpy())
+        dev_idx += list(order[:DEV_PER_TASK])
+        test_idx += list(order[DEV_PER_TASK:][: int(per_task) if per_task else None])
+    return df.loc[sorted(dev_idx if split == "dev" else test_idx)]
 
 
 def make_press(spec: dict, compression_ratio: float):
