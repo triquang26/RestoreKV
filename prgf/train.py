@@ -24,7 +24,9 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from prgf import speedups
 from prgf.data import kvpress_inputs
-from prgf.masking import MaskMode, attention_bias, exchange_layer, restore_pass_provider, student_pass_provider
+from prgf.masking import (
+    MaskMode, attention_bias, exchange_layer, region_ids, restore_pass_provider, student_pass_provider,
+)
 from prgf.press import EMBEDDINGS_FILE, PartitionedRestoreKVPress
 
 
@@ -45,6 +47,11 @@ class TrainConfig:
     budget_max: float = 0.25
     max_qa_per_step: int = 5
     max_answer_tokens: int = 512
+    # Partitioned reconstruction distillation: per step, one evicted-region span per local slot, reproduced
+    # from the compressed cache ("Repeat the part ... starting with: <prefix>"), distilled from the full cache.
+    recon_weight: float = 0.0
+    recon_span: int = 64
+    recon_prefix: int = 8
     seed: int = 0
     resume_from: str | None = None  # checkpoint dir with trainer_state.pt: continue that run exactly
     score_cache_dir: str | None = None  # per-context KVzip scores, filled on first use and reused by later runs
@@ -82,11 +89,13 @@ class PhaseTimer:
         return out
 
 
-def symmetric_kl(teacher_logits: torch.Tensor, student_logits: torch.Tensor) -> torch.Tensor:
+def symmetric_kl(teacher_logits: torch.Tensor, student_logits: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
+    """Symmetric KL per predicted token; mean, or weighted sum when per-token ``weights`` are given."""
     lt, ls = F.log_softmax(teacher_logits.float(), -1), F.log_softmax(student_logits.float(), -1)
     kl_ts = (lt.exp() * (lt - ls)).sum(-1)
     kl_st = (ls.exp() * (ls - lt)).sum(-1)
-    return 0.5 * (kl_ts + kl_st).mean()
+    kl = 0.5 * (kl_ts + kl_st)
+    return kl.mean() if weights is None else (kl * weights).sum()
 
 
 class Trainer:
@@ -163,20 +172,46 @@ class Trainer:
         save_file({"scores": scores.contiguous().cpu()}, path + ".tmp")
         os.replace(path + ".tmp", path)  # atomic: concurrent runs never read a partial file
 
+    RECON_QUESTION = "Repeat the part of the previous context exactly, starting with: {}"
+
+    def _recon_pairs(self, ctx_ids: list[int]) -> list[tuple[list[int], list[int]]]:
+        """One (question, span) pair per local region: the span lies inside region j, whose evicted part
+        only local slot R_j can read, so its reconstruction error is attributable to that slot."""
+        T, n_local, span, pre = len(ctx_ids), self.num_restore - 1, self.cfg.recon_span, self.cfg.recon_prefix
+        regions = region_ids(T, n_local).tolist()
+        questions, answers = [], []
+        for j in range(n_local):
+            lo, hi = regions.index(j), T - regions[::-1].index(j)
+            lo = max(lo, pre + 8)  # skip the chat-template prefix / attention sinks
+            if hi - span <= lo:
+                continue
+            start = self.rng.randrange(lo, hi - span)
+            questions.append(self.RECON_QUESTION.format(self.tok.decode(ctx_ids[start - pre : start])))
+            answers.append(ctx_ids[start : start + span])
+        if not questions:
+            return []
+        _, q_ids = kvpress_inputs(self.tok, "", questions)
+        return list(zip(q_ids, answers))
+
     def _batch(self, sample):
         ctx_ids, q_ids = kvpress_inputs(self.tok, sample["context"], sample["questions"])
         pairs = [(q, a[: self.cfg.max_answer_tokens]) for q, a in zip(q_ids, sample["answer_ids"]) if a]
         pairs = self.rng.sample(pairs, min(len(pairs), self.cfg.max_qa_per_step))
-        length = max(len(q) + len(a) for q, a in pairs)
+        recon = self._recon_pairs(ctx_ids) if self.cfg.recon_weight > 0 else []
+        n_qa, n_rec = sum(len(a) for _, a in pairs), sum(len(a) for _, a in recon)
+        length = max(len(q) + len(a) for q, a in pairs + recon)
         pad = self.tok.pad_token_id or 0
-        ids = torch.full((len(pairs), length), pad, dtype=torch.long)
-        rows, cols = [], []
-        for b, (q, a) in enumerate(pairs):
+        ids = torch.full((len(pairs) + len(recon), length), pad, dtype=torch.long)
+        rows, cols, weights = [], [], []
+        for b, (q, a) in enumerate(pairs + recon):
             ids[b, : len(q) + len(a)] = torch.tensor(q + a)
             rows += [b] * len(a)  # logits at position p predict token p+1: answer tokens are predicted
             cols += range(len(q) - 1, len(q) - 1 + len(a))  # from the last question token onwards
+            # loss = mean over QA tokens + recon_weight * mean over reconstruction tokens
+            weights += [1 / n_qa if b < len(pairs) else self.cfg.recon_weight / n_rec] * len(a)
         dev = self.model.device
-        return torch.tensor([ctx_ids], device=dev), ids.to(dev), (torch.tensor(rows, device=dev), torch.tensor(cols, device=dev))
+        where = (torch.tensor(rows, device=dev), torch.tensor(cols, device=dev))
+        return torch.tensor([ctx_ids], device=dev), ids.to(dev), where, torch.tensor(weights, device=dev)
 
     def _logits(self, qa_ids, cache, start, where):
         pos = torch.arange(start, start + qa_ids.shape[1], device=qa_ids.device)[None].expand(qa_ids.shape[0], -1)
@@ -186,7 +221,7 @@ class Trainer:
     def step(self, sample):
         model, n = self.model, self.num_restore
         self.timer.start()
-        ctx_ids, qa_ids, where = self._batch(sample)
+        ctx_ids, qa_ids, where, weights = self._batch(sample)
         batch = qa_ids.shape[0]
 
         # 1) prefill + KVzip selection (reserves n*L*H pairs of the budget for the restore slots)
@@ -239,7 +274,7 @@ class Trainer:
         with attention_bias(student_pass_provider(kept, n, self.num_groups)):
             student = self._logits(qa_ids, student_cache, T + n, where)
 
-        loss = symmetric_kl(teacher, student)
+        loss = symmetric_kl(teacher, student, weights)
         self.timer.lap("student_fwd")
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_([self.embeddings, *self.lora], self.cfg.max_grad_norm)

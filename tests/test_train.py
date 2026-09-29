@@ -100,7 +100,7 @@ def test_cached_scores_give_identical_selection(tiny):
     )
     trainer = Trainer(cfg)
     sample = trainer.data[0]
-    ctx_ids, _, _ = trainer._batch(sample)
+    ctx_ids, _, _, _ = trainer._batch(sample)
     trainer.press.compression_ratio = 0.9
     from transformers import DynamicCache
 
@@ -138,3 +138,24 @@ def test_resume_matches_uninterrupted_run(tiny):
     torch.testing.assert_close(second.embeddings, straight.embeddings)
     for a, b in zip(second.lora, straight.lora):
         torch.testing.assert_close(a, b)
+
+
+def test_reconstruction_pairs_are_region_local_context_spans(tiny):
+    from prgf.masking import region_ids
+
+    root, _ = tiny
+    cfg = TrainConfig(data_path=str(root / "data.jsonl"), output_dir=str(root / "out_recon"), model=str(root / "model"),
+                      init_adapter=str(root / "adapter"), recon_weight=1.0, recon_span=8, steps=2, warmup_steps=1)
+    trainer = Trainer(cfg)
+    ctx_ids, qa_ids, where, weights = trainer._batch(trainer.data[0])
+    ctx = ctx_ids[0].tolist()
+    regions = region_ids(len(ctx), trainer.num_restore - 1).tolist()
+    pairs = trainer._recon_pairs(ctx)
+    assert len(pairs) == trainer.num_restore - 1  # one span per local slot
+    for j, (q, a) in enumerate(pairs):
+        start = next(i for i in range(len(ctx)) if ctx[i : i + len(a)] == a)
+        assert {regions[i] for i in range(start, start + len(a))} == {j}  # span inside region j only
+        assert "Repeat the part of the previous context exactly" in trainer.tok.decode(q)
+    # QA tokens and reconstruction tokens each contribute a normalized mean (weights sum to 1 + recon_weight)
+    torch.testing.assert_close(weights.sum(), torch.tensor(2.0), rtol=1e-5, atol=1e-5)
+    trainer.train()  # runs end to end with the extra targets
