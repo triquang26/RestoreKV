@@ -61,6 +61,18 @@ press = RestoreKVPress(...)
 See [`kvpress/presses/restorekv_press.py`](https://github.com/NVIDIA/kvpress/blob/main/kvpress/presses/restorekv_press.py)
 for the full inference implementation and arguments.
 
+### Run on Modal (A100-80GB)
+
+`modal_app.py` runs a demo that compares full cache, KVzip and RestoreKV (Qwen3-8B, same KV budget) on a synthetic long-context retrieval task.
+
+```bash
+pip install 'modal[api-proxy-support]'   # proxy extra only needed behind an HTTP(S) proxy
+modal token set --token-id <id> --token-secret <secret>
+modal run modal_app.py                                   # 5% budget, ~8K-token context
+modal run modal_app.py --compression-ratio 0.99 --n-facts 20 --context-tokens 16000
+modal run modal_app.py --plus                            # KVzip+ / RestoreKV+ adapters
+```
+
 ## 🗺️ Release Plan
 
 - [x] Inference code (integrated into [NVIDIA/KVPress](https://github.com/NVIDIA/kvpress))
