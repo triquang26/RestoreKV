@@ -175,3 +175,45 @@ def test_train_chained_layout_from_v1_checkpoint(tiny):
     cache = DynamicCache()
     pipe(" ".join(f"fact{i}" for i in range(150)), question="What?", press=press, cache=cache, max_new_tokens=2)
     assert press.num_restore_tokens == 16
+
+
+def test_transport_press_and_trainer(tiny):
+    root, tok = tiny
+    cfg = TrainConfig(data_path=str(root / "data.jsonl"), output_dir=str(root / "out_ot"), model=str(root / "model"),
+                      init_adapter=str(root / "adapter"), slots_per_region=2, num_global=2, transport=True,
+                      recon_weight=1.0, recon_span=8, steps=2, warmup_steps=1, lr=1e-2)
+    trainer = Trainer(cfg)
+    assert trainer.press.reserved_per_head == 17  # 16 slots + one pair holding the 16 mass scalars
+    before = trainer.embeddings.detach().clone()
+    trainer.train()
+    assert not torch.equal(before, trainer.embeddings.detach())  # gradient reaches the PRGF init through P
+
+    model = Qwen3ForCausalLM.from_pretrained(root / "model", attn_implementation="sdpa")
+    pipe = pipeline("kv-press-text-generation", model=model, tokenizer=tok, device="cpu")
+    press = PartitionedRestoreKVPress(compression_ratio=0.75, adapter=f"{cfg.output_dir}/final",
+                                      slots_per_region=2, num_global=2, transport=True)
+    context = " ".join(f"fact{i}" for i in range(200))
+    cache = DynamicCache()
+    answer = pipe(context, question="What?", press=press, cache=cache, max_new_tokens=3)["answer"]
+    assert isinstance(answer, str)
+    T = cache.get_seq_length() - 16
+    L, H = model.config.num_hidden_layers, model.config.num_key_value_heads
+    masked = sum(len(layer.self_attn.masked_key_indices[2]) for layer in model.model.layers)
+    assert abs((L * H * T - masked) + 17 * L * H - L * H * T * 0.25) <= 1  # budget includes the mass scalars
+    start, log_mass = model.model.layers[0].self_attn.prgf_slot_bias
+    assert start == T and log_mass.shape == (H, 16)
+    kept = press.kept_mask[0]
+    torch.testing.assert_close(log_mass.exp().sum(-1), (~kept).sum(-1).float(), rtol=1e-4, atol=1e-3)
+
+
+def test_query_second_moment_is_psd(tiny):
+    from prgf.calibrate import query_second_moment
+
+    root, tok = tiny
+    model = Qwen3ForCausalLM.from_pretrained(root / "model")
+    samples = [json.loads(line) for line in open(root / "data.jsonl")]
+    G = query_second_moment(model, tok, samples)
+    cfg = model.config
+    assert G.shape == (cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, cfg.head_dim)
+    torch.testing.assert_close(G, G.transpose(-1, -2))
+    assert (torch.linalg.eigvalsh(G) > -1e-5).all()

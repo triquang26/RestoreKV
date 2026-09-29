@@ -103,6 +103,7 @@ def train(
     name: str, mask_mode: str = "prgf", steps: int = 2000, lr: float = 1e-4, max_answer_tokens: int = 256,
     seed: int = 0, init_adapter: str = "", exchange_from: float = -1.0, warmup_steps: int = 50, save_every: int = 500,
     recon_weight: float = 0.0, recon_span: int = 64, slots_per_region: int = 1, num_global: int = 1,
+    transport: bool = False, transport_tau: float = 0.1, transport_lambda_v: float = 1.0, query_moment: str = "",
 ):
     cfg = dict(
         data_path=f"{RUNS}/data/train.jsonl", output_dir=f"{RUNS}/ckpt/{name}", model=MODEL,
@@ -110,6 +111,8 @@ def train(
         init_adapter=init_adapter or None, exchange_from=exchange_from if exchange_from >= 0 else None,
         warmup_steps=warmup_steps, save_every=save_every, score_cache_dir=f"{RUNS}/data/kvzip_scores",
         recon_weight=recon_weight, recon_span=recon_span, slots_per_region=slots_per_region, num_global=num_global,
+        transport=transport, transport_tau=transport_tau, transport_lambda_v=transport_lambda_v,
+        query_moment=query_moment or None,
     )
     call = train_remote.spawn(cfg)  # runs server-side; needs `modal run --detach`
     print(f"spawned {call.object_id}; checkpoints -> {cfg['output_dir']}")
@@ -340,3 +343,31 @@ def evaluate_when_ready(ckpt_dir: str, name: str, spec: dict, ratios: list[float
 def evaluate_later(ckpt: str, name: str, spec: str, ratios: str = "0.9375", split: str = "dev", n_shards: int = 2):
     call = evaluate_when_ready.spawn(ckpt, name, json.loads(spec), [float(r) for r in ratios.split(",")], split, n_shards)
     print(f"queued {call.object_id}: evaluates {ckpt} when it appears")
+
+
+# ----------------------------------------------------------------------------- transport calibration
+@app.function(image=kv_image, gpu="A100", volumes=volumes, timeout=3600)
+def calibrate_remote(n_samples: int, seed: int) -> str:
+    import random
+
+    import torch
+    from safetensors.torch import save_file
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    from prgf.calibrate import query_second_moment
+
+    with open(f"{RUNS}/data/train.jsonl") as f:
+        data = [json.loads(line) for line in f]
+    samples = random.Random(seed).sample(data, n_samples)
+    tok = AutoTokenizer.from_pretrained(MODEL)
+    model = AutoModelForCausalLM.from_pretrained(MODEL, dtype=torch.bfloat16, attn_implementation="sdpa", device_map="cuda:0")
+    G = query_second_moment(model, tok, samples)
+    path = f"{RUNS}/data/query_moment.safetensors"
+    save_file({"G": G.contiguous()}, path)
+    runs.commit()
+    return f"{path}: G {tuple(G.shape)}, mean trace {G.diagonal(dim1=-2, dim2=-1).sum(-1).mean():.3f}"
+
+
+@app.local_entrypoint()
+def calibrate(n_samples: int = 64, seed: int = 0):
+    print(calibrate_remote.remote(n_samples, seed))

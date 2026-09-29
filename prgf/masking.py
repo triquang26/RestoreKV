@@ -54,10 +54,19 @@ def _install():
     def sdpa_with_bias(module, query, key, value, attention_mask, *args, **kwargs):
         provider = _PROVIDER.get()
         if provider is None:
+            slot_bias = getattr(module, "prgf_slot_bias", None)
+            if slot_bias is not None and query.shape[-2] == key.shape[-2]:
+                module.prgf_slot_bias = slot_bias = None  # a new prefill: the previous context's memory is gone
+            if slot_bias is not None:  # transport-written slots enter attention with + log(mass)
+                start, log_mass = slot_bias
+                groups = query.shape[1] // log_mass.shape[0]
+                attention_mask = slot_bias_mask(log_mass, start, query.shape[-2], key.shape[-2], groups, query.dtype)
             return previous(module, query, key, value, attention_mask, *args, **kwargs)
 
         def attend(q, k, v):
             mask = provider(module.layer_idx, q.shape[-2], k.shape[-2])
+            if mask.is_floating_point():
+                mask = mask.to(q.dtype)
             # Stock kernel (not the kvpress fake-key patch): keys stay untouched during these passes.
             return sdpa_attention_forward(module, q, k, v, mask, *args, **kwargs)[0]
 
@@ -71,6 +80,18 @@ def _install():
 
 
 _install()
+
+
+def slot_bias_mask(log_mass: torch.Tensor, start: int, q_len: int, k_len: int, num_groups: int, dtype) -> torch.Tensor:
+    """Additive mask (1, H_q, q_len, k_len): log(mass) on the n slot columns [start, start+n), causal on the
+    last q_len columns (the new query tokens), 0 elsewhere."""
+    device, n = log_mass.device, log_mass.shape[-1]
+    mask = torch.zeros(log_mass.shape[0], q_len, k_len, dtype=torch.float32, device=device)
+    mask[:, :, start : start + n] = log_mass.float()[:, None, :]
+    if q_len > 1:
+        future = torch.ones(q_len, q_len, dtype=torch.bool, device=device).triu(1)
+        mask[:, :, k_len - q_len :] = mask[:, :, k_len - q_len :].masked_fill(future, float("-inf"))
+    return mask.repeat_interleave(num_groups, dim=0)[None].to(dtype)
 
 
 def region_ids(context_length: int, num_regions: int, device=None) -> torch.Tensor:
@@ -150,11 +171,20 @@ def restore_pass_provider(
     return provider
 
 
-def student_pass_provider(kept: torch.Tensor, num_restore: int, num_groups: int) -> MaskProvider:
+def student_pass_provider(
+    kept: torch.Tensor, num_restore: int, num_groups: int, log_mass: torch.Tensor | None = None
+) -> MaskProvider:
+    """log_mass (num_layers, num_kv_heads, n): transport-written slots get + log(mass) on their logits."""
     context_length = kept.shape[-1]
 
     def provider(layer_idx: int, q_len: int, k_len: int) -> torch.Tensor:
         assert k_len == context_length + num_restore + q_len, (q_len, k_len)
-        return _to_query_heads(student_allowed(kept[layer_idx], num_restore, q_len), num_groups)
+        allowed = student_allowed(kept[layer_idx], num_restore, q_len)
+        if log_mass is None:
+            return _to_query_heads(allowed, num_groups)
+        bias = torch.zeros(allowed.shape, dtype=torch.float32, device=allowed.device)
+        bias[..., context_length : context_length + num_restore] = log_mass[layer_idx].float()[:, None, :]
+        bias = bias.masked_fill(~allowed, float("-inf"))
+        return _to_query_heads(bias, num_groups)
 
     return provider

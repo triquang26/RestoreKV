@@ -28,6 +28,7 @@ from prgf.masking import (
     MaskMode, attention_bias, exchange_layer, region_ids, restore_pass_provider, student_pass_provider,
 )
 from prgf.press import EMBEDDINGS_FILE, PartitionedRestoreKVPress, expand_restore_embeddings
+from prgf.transport import slot_scope, transport_write
 
 
 @dataclass
@@ -40,6 +41,11 @@ class TrainConfig:
     exchange_from: float | None = None  # PRGF v2: local slots read G from layer floor(exchange_from * L)
     slots_per_region: int = 1  # k chained local slots per region (v1 checkpoints are expanded on load)
     num_global: int = 1
+    transport: bool = False  # transport-written slots (prgf/transport.py); gradients flow through the rounds
+    transport_iters: int = 2
+    transport_tau: float = 0.1
+    transport_lambda_v: float = 1.0
+    query_moment: str | None = None
     steps: int = 2000
     lr: float = 1e-4
     warmup_steps: int = 50
@@ -131,6 +137,9 @@ class Trainer:
             embeddings = expand_restore_embeddings(embeddings, k, g)
         self.press.restore_embeddings = embeddings.to(self.model.dtype)  # budget matching pays for every slot
         self.press.slots_per_region, self.press.num_global = k, g
+        self.press.transport, self.press.query_moment = cfg.transport, cfg.query_moment
+        self.press.transport_iters, self.press.transport_tau = cfg.transport_iters, cfg.transport_tau
+        self.press.transport_lambda_v = cfg.transport_lambda_v
         self.embeddings = torch.nn.Parameter(embeddings.clone())
         self.num_restore = self.embeddings.shape[0]
         self.num_regions = (self.num_restore - g) // k
@@ -275,6 +284,15 @@ class Trainer:
         finally:
             self._adapters(False)
         slots = [(layer.keys[:, :, T:], layer.values[:, :, T:]) for layer in restore_cache.layers]
+        log_mass = None
+        if self.cfg.transport:  # slots become conserving aggregates of the evicted KV (differentiable in the init)
+            scope = slot_scope(self.num_regions, self.cfg.slots_per_region, self.cfg.num_global, T, model.device)
+            G, written, log_mass = self.press.query_moment_for(model), [], []
+            for i, ((k, v), (sk, sv)) in enumerate(zip(ctx_kv, slots)):
+                mu, nu, lm = transport_write(k[0], v[0], sk[0], sv[0], ~kept[i], scope, G[i], self.press.transport_config)
+                written.append((mu[None], nu[None]))
+                log_mass.append(lm)
+            slots, log_mass = written, torch.stack(log_mass)
         self.timer.lap("restore")
 
         # 4) student over kept cache + restore slots (evicted positions are hard-masked)
@@ -282,7 +300,7 @@ class Trainer:
             (torch.cat([k, sk], 2).expand(batch, -1, -1, -1), torch.cat([v, sv], 2).expand(batch, -1, -1, -1))
             for (k, v), (sk, sv) in zip(ctx_kv, slots)
         ])
-        with attention_bias(student_pass_provider(kept, n, self.num_groups)):
+        with attention_bias(student_pass_provider(kept, n, self.num_groups, log_mass)):
             student = self._logits(qa_ids, student_cache, T + n, where)
 
         loss = symmetric_kl(teacher, student, weights)

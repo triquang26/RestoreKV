@@ -11,6 +11,7 @@ from safetensors.torch import load_file
 from transformers import PreTrainedModel
 
 from prgf.masking import MaskMode, attention_bias, exchange_layer, restore_pass_provider
+from prgf.transport import TransportConfig, slot_scope, transport_write
 
 EMBEDDINGS_FILE = "restore_embeddings.safetensors"
 
@@ -104,9 +105,15 @@ class PartitionedRestoreKVPress(RestoreKVPress):
     exchange_from: float | None = None
     slots_per_region: int = 1
     num_global: int = 1
+    transport: bool = False  # write the slots by conserving transport of the evicted KV (see prgf/transport.py)
+    transport_iters: int = 2
+    transport_tau: float = 0.1
+    transport_lambda_v: float = 1.0
+    query_moment: str | None = None  # safetensors file with G (L, H_kv, d, d); None -> identity
     selection_only: bool = False
     drop_slots_at_decode: bool = False  # diagnostics only: evict the restore slots again after building them
     kept_mask: torch.Tensor | None = field(init=False, default=None, repr=False)
+    _query_moment: torch.Tensor | None = field(init=False, default=None, repr=False)
     scores: torch.Tensor | None = field(init=False, default=None, repr=False)  # KVzip scores of the last context
 
     @property
@@ -132,7 +139,7 @@ class PartitionedRestoreKVPress(RestoreKVPress):
         self.scores = self.score_val.clone() if self.selection_only else None  # before sinks are overwritten
         requested_ratio = self.compression_ratio
         if self.context_length > 0:
-            self.compression_ratio = min(1.0, requested_ratio + self.num_restore_tokens / self.context_length)
+            self.compression_ratio = min(1.0, requested_ratio + self.reserved_per_head / self.context_length)
         try:
             KVzipPress.compress_post(self, model)
         finally:
@@ -144,8 +151,45 @@ class PartitionedRestoreKVPress(RestoreKVPress):
             return
         # 2) Restore pass over the still-complete cache, masked per (layer, KV head).
         self.append_restore_tokens(model)
+        if self.transport:
+            self._transport_write(model)
         if self.drop_slots_at_decode:
             self._mask_restore_slots(model)
+
+    @property
+    def reserved_per_head(self) -> int:
+        """KV pairs per (layer, head) paid for the restore memory: n slots (+1 pair holding the n mass scalars)."""
+        return self.num_restore_tokens + int(self.transport)
+
+    @property
+    def transport_config(self) -> TransportConfig:
+        return TransportConfig(self.transport_iters, self.transport_tau, self.transport_lambda_v)
+
+    def query_moment_for(self, model: PreTrainedModel) -> torch.Tensor:
+        if self._query_moment is None:
+            L, H = model.config.num_hidden_layers, model.config.num_key_value_heads
+            d = model.config.head_dim
+            if self.query_moment is None:
+                G = torch.eye(d).expand(L, H, d, d)
+            else:
+                G = load_file(self.query_moment)["G"]
+            self._query_moment = G.to(model.device, torch.float32)
+        return self._query_moment
+
+    @torch.inference_mode()  # the cache tensors were created under inference mode
+    def _transport_write(self, model: PreTrainedModel):
+        cache, T, n = self._cache, self.context_length, self.num_restore_tokens
+        n_regions = (n - self.num_global) // self.slots_per_region
+        scope = slot_scope(n_regions, self.slots_per_region, self.num_global, T, model.device)
+        G = self.query_moment_for(model)
+        for i, (layer, cache_layer) in enumerate(zip(model.model.layers, cache.layers)):
+            keys, values = cache_layer.keys[0], cache_layer.values[0]  # (H, T + n, d), post-RoPE
+            mu, nu, log_mass = transport_write(
+                keys[:, :T], values[:, :T], keys[:, T : T + n], values[:, T : T + n], ~self.kept_mask[i], scope, G[i],
+                self.transport_config,
+            )
+            keys[:, T : T + n], values[:, T : T + n] = mu, nu
+            layer.self_attn.prgf_slot_bias = (T, log_mass)
 
     def _mask_restore_slots(self, model: PreTrainedModel):
         n, T = self.num_restore_tokens, self.context_length

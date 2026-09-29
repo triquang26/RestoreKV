@@ -60,7 +60,10 @@ def make_press(spec: dict, compression_ratio: float):
     return PartitionedRestoreKVPress(
         compression_ratio=compression_ratio, kvzip_plus_normalization=plus, adapter=spec.get("adapter"), mask_mode=mode,
         exchange_from=spec.get("exchange_from"), drop_slots_at_decode=spec.get("drop_slots_at_decode", False),
-        slots_per_region=spec.get("slots_per_region", 1), num_global=spec.get("num_global", 1), **extra,
+        slots_per_region=spec.get("slots_per_region", 1), num_global=spec.get("num_global", 1),
+        transport=spec.get("transport", False), query_moment=spec.get("query_moment"),
+        transport_iters=spec.get("transport_iters", 2), transport_tau=spec.get("transport_tau", 0.1),
+        transport_lambda_v=spec.get("transport_lambda_v", 1.0), **extra,
     )
 
 
