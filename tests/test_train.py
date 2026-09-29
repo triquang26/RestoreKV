@@ -111,3 +111,30 @@ def test_cached_scores_give_identical_selection(tiny):
     cached = trainer.press.select_from_scores(trainer.model, trainer._load_scores(sample))
     assert torch.equal(fresh, cached)
     assert not cached.all()  # something was actually evicted
+
+
+def test_resume_matches_uninterrupted_run(tiny):
+    """Train 4 steps straight vs 2 steps + resume to 4: identical final weights."""
+    from prgf.train import latest_checkpoint
+
+    root, _ = tiny
+    common = dict(data_path=str(root / "data.jsonl"), model=str(root / "model"), init_adapter=str(root / "adapter"),
+                  steps=4, warmup_steps=1, lr=1e-2, save_every=2, log_every=1)
+    straight = Trainer(TrainConfig(output_dir=str(root / "straight"), **common))
+    straight.train()
+
+    class Crash(Exception):
+        pass
+
+    def crash():  # the job dies right after the step-2 checkpoint
+        raise Crash
+
+    with pytest.raises(Crash):
+        Trainer(TrainConfig(output_dir=str(root / "resumed"), **common)).train(on_save=crash)
+    resume = latest_checkpoint(str(root / "resumed"))
+    assert resume.endswith("step2")
+    second = Trainer(TrainConfig(output_dir=str(root / "resumed"), resume_from=resume, **common))
+    second.train()
+    torch.testing.assert_close(second.embeddings, straight.embeddings)
+    for a, b in zip(second.lora, straight.lora):
+        torch.testing.assert_close(a, b)

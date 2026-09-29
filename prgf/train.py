@@ -46,6 +46,7 @@ class TrainConfig:
     max_qa_per_step: int = 5
     max_answer_tokens: int = 512
     seed: int = 0
+    resume_from: str | None = None  # checkpoint dir with trainer_state.pt: continue that run exactly
     score_cache_dir: str | None = None  # per-context KVzip scores, filled on first use and reused by later runs
     log_every: int = 25
     save_every: int = 500
@@ -99,7 +100,9 @@ class Trainer:
             cfg.model, dtype=torch.bfloat16, attn_implementation="sdpa",
             device_map="cuda:0" if torch.cuda.is_available() else "cpu",
         ).eval()  # eval(): no dropout; gradients still flow
-        self.press = PartitionedRestoreKVPress(adapter=cfg.init_adapter, mask_mode=cfg.mask_mode, selection_only=True)
+        self.press = PartitionedRestoreKVPress(
+            adapter=cfg.resume_from or cfg.init_adapter, mask_mode=cfg.mask_mode, selection_only=True
+        )
         self.press.post_init_from_model(self.model)
         self.adapter = self.press.adapter_name
         self.num_groups = self.model.config.num_attention_heads // self.model.config.num_key_value_heads
@@ -246,33 +249,63 @@ class Trainer:
         self.timer.lap("backward_optim")
         return loss.item(), grad_norm.item(), 1 - self.press.compression_ratio
 
-    def save(self, path):
+    def save(self, path, step: int, order: list[int]):
         os.makedirs(path, exist_ok=True)
         self.model.set_adapter(self.adapter)
         self.model.save_pretrained(path)  # adapter-only save with transformers' PEFT integration
         save_file({"restore_embeddings": self.embeddings.detach().to(torch.bfloat16).cpu()}, os.path.join(path, EMBEDDINGS_FILE))
         with open(os.path.join(path, "train_config.json"), "w") as f:
             json.dump(asdict(self.cfg), f, indent=2)
+        state = {
+            "step": step, "order": order, "optim": self.optim.state_dict(), "sched": self.sched.state_dict(),
+            "rng": self.rng.getstate(), "torch_rng": torch.get_rng_state(),
+            # fp32 master weights: the saved adapter is re-loaded in the model dtype (bf16)
+            "fp32_embeddings": self.embeddings.detach().cpu(), "fp32_lora": [p.detach().cpu() for p in self.lora],
+        }
+        torch.save(state, os.path.join(path, "trainer_state.pt"))
+
+    def _resume(self) -> tuple[int, list[int]]:
+        state = torch.load(os.path.join(self.cfg.resume_from, "trainer_state.pt"), weights_only=False)
+        self.optim.load_state_dict(state["optim"])
+        self.sched.load_state_dict(state["sched"])
+        self.rng.setstate(state["rng"])
+        torch.set_rng_state(state["torch_rng"])
+        with torch.no_grad():  # bf16 copies were loaded through the press; restore the fp32 master weights
+            self.embeddings.copy_(state["fp32_embeddings"].to(self.embeddings.device))
+            for p, saved in zip(self.lora, state["fp32_lora"], strict=True):
+                p.copy_(saved.to(p.device))
+        print(f"resumed from {self.cfg.resume_from} at step {state['step']}")
+        return state["step"], state["order"]
 
     def train(self, on_save=None):
-        order, t0, window = [], time.time(), []
-        for step in range(self.cfg.steps):
+        start, order = self._resume() if self.cfg.resume_from else (0, [])
+        t0, window = time.time(), []
+        for step in range(start, self.cfg.steps):
             if not order:
                 order = list(range(len(self.data)))
                 self.rng.shuffle(order)
             loss, gnorm, budget = self.step(self.data[order.pop()])
             window.append(loss)
             if (step + 1) % self.cfg.log_every == 0:
-                rate = (step + 1) / (time.time() - t0)
+                rate = (step + 1 - start) / (time.time() - t0)
                 print(
                     f"step {step + 1}/{self.cfg.steps} loss {sum(window) / len(window):.4f} gnorm {gnorm:.3f} "
                     f"budget {budget:.3f} lr {self.sched.get_last_lr()[0]:.2e} {rate:.2f} it/s | "
-                    f"{self.timer.summary(self.cfg.log_every)}",
+                    f"{self.timer.summary(len(window))}",
                     flush=True,
                 )
                 window = []
             if (step + 1) % self.cfg.save_every == 0 or step + 1 == self.cfg.steps:
                 path = os.path.join(self.cfg.output_dir, f"step{step + 1}" if step + 1 < self.cfg.steps else "final")
-                self.save(path)
+                self.save(path, step + 1, order)
                 if on_save:
                     on_save()
+
+
+def latest_checkpoint(output_dir: str) -> str | None:
+    """Most advanced resumable checkpoint of a run (``final`` excluded: that run is complete)."""
+    if not os.path.isdir(output_dir):
+        return None
+    steps = [d for d in os.listdir(output_dir)
+             if d.startswith("step") and os.path.exists(os.path.join(output_dir, d, "trainer_state.pt"))]
+    return os.path.join(output_dir, max(steps, key=lambda d: int(d[4:]))) if steps else None

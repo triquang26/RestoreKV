@@ -1,8 +1,8 @@
 """Modal jobs for Partitioned Restore with Global Fusion (PRGF): data, training, RULER-4K evaluation.
 
-    modal run modal_prgf.py::build_data                         # teacher QA data -> /runs/data/train.jsonl
-    modal run modal_prgf.py::train --name prgf --mask-mode prgf  # -> /runs/ckpt/<name>/final
-    modal run modal_prgf.py::evaluate --name kvzip --spec '{"method": "kvzip"}' --ratios 0.9,0.95 --split dev
+    modal run modal_prgf.py::build_data                                   # teacher QA -> /runs/data/train.jsonl
+    modal run --detach modal_prgf.py::train --name prgf --mask-mode prgf   # -> /runs/ckpt/<name>/final (auto-resume)
+    modal run --detach modal_prgf.py::evaluate --name kvzip --spec '{"method": "kvzip"}' --ratios 0.9,0.95 --split dev
     modal run modal_prgf.py::report --split dev                 # table of everything under /runs/results
 
 GPU budget: every GPU function is capped (max_containers) so that one data/eval job plus one training
@@ -88,9 +88,11 @@ def build_data(n_longalpaca: int = 1200, n_pg19: int = 1000, n_flan: int = 500, 
 # ----------------------------------------------------------------------------- training
 @app.function(image=kv_image, gpu="A100-80GB", volumes=volumes, timeout=24 * 3600, max_containers=2)
 def train_remote(cfg: dict):
-    from prgf.train import TrainConfig, Trainer
+    from prgf.train import TrainConfig, Trainer, latest_checkpoint
 
-    trainer = Trainer(TrainConfig(**cfg))
+    runs.reload()
+    resume = latest_checkpoint(cfg["output_dir"])  # a previous attempt of this run died: continue it exactly
+    trainer = Trainer(TrainConfig(**cfg, resume_from=resume))
     hf_cache.commit()
     trainer.train(on_save=runs.commit)
     runs.commit()
@@ -107,7 +109,8 @@ def train(
         init_adapter=init_adapter or None, exchange_from=exchange_from if exchange_from >= 0 else None,
         warmup_steps=warmup_steps, save_every=save_every, score_cache_dir=f"{RUNS}/data/kvzip_scores",
     )
-    train_remote.remote(cfg)
+    call = train_remote.spawn(cfg)  # runs server-side; needs `modal run --detach`
+    print(f"spawned {call.object_id}; checkpoints -> {cfg['output_dir']}")
 
 
 # ----------------------------------------------------------------------------- evaluation
@@ -187,7 +190,19 @@ def evaluate_remote(name: str, spec: dict, ratios: list[float], split: str, n_sh
 
 @app.local_entrypoint()
 def evaluate(name: str, spec: str, ratios: str = "0.8,0.9,0.95", split: str = "dev", n_shards: int = 2):
-    print(evaluate_remote.remote(name, json.loads(spec), [float(r) for r in ratios.split(",")], split, n_shards))
+    call = evaluate_remote.spawn(name, json.loads(spec), [float(r) for r in ratios.split(",")], split, n_shards)
+    print(_wait(call))
+
+
+def _wait(call, poll_s: int = 60):
+    """Wait for a spawned call, surviving client-side network hiccups (the call keeps running server-side)."""
+    while True:
+        try:
+            return call.get(timeout=poll_s)
+        except (TimeoutError, modal.exception.TimeoutError):
+            continue
+        except (ConnectionError, OSError) as e:
+            print(f"connection issue ({e!r}); still waiting for {call.object_id}")
 
 
 @app.function(image=kv_image, volumes=volumes)
