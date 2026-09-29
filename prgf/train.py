@@ -38,6 +38,7 @@ class TrainConfig:
     model: str = "Qwen/Qwen3-8B"
     init_adapter: str | None = None  # None -> official RestoreKV checkpoint of `model`
     mask_mode: MaskMode = "prgf"
+    plus: bool = False  # KVzip+ scoring (kvzip_plus_normalization) for eviction; use a separate score cache
     exchange_from: float | None = None  # PRGF v2: local slots read G from layer floor(exchange_from * L)
     slots_per_region: int = 1  # k chained local slots per region (v1 checkpoints are expanded on load)
     num_global: int = 1
@@ -118,7 +119,8 @@ class Trainer:
             device_map="cuda:0" if torch.cuda.is_available() else "cpu",
         ).eval()  # eval(): no dropout; gradients still flow
         self.press = PartitionedRestoreKVPress(
-            adapter=cfg.resume_from or cfg.init_adapter, mask_mode=cfg.mask_mode, selection_only=True
+            adapter=cfg.resume_from or cfg.init_adapter, mask_mode=cfg.mask_mode, selection_only=True,
+            kvzip_plus_normalization=cfg.plus,
         )
         self.press.post_init_from_model(self.model)
         self.adapter = self.press.adapter_name

@@ -91,14 +91,16 @@ def test_kvpress_inputs_matches_pipeline():
     assert qs == [q[0].tolist() for q in ref["questions_ids"]]
 
 
-def test_cached_scores_give_identical_selection(tiny):
-    """Second pass over the same sample loads KVzip scores from disk and must select the same KV pairs."""
+@pytest.mark.parametrize("plus", [False, True])
+def test_cached_scores_give_identical_selection(tiny, plus):
+    """Second pass over the same sample loads KVzip(+) scores from disk and must select the same KV pairs."""
     root, _ = tiny
     cfg = TrainConfig(
-        data_path=str(root / "data.jsonl"), output_dir=str(root / "out_cache"), model=str(root / "model"),
-        init_adapter=str(root / "adapter"), score_cache_dir=str(root / "scores"), steps=1,
+        data_path=str(root / "data.jsonl"), output_dir=str(root / f"out_cache{plus}"), model=str(root / "model"),
+        init_adapter=str(root / "adapter"), score_cache_dir=str(root / f"scores{plus}"), steps=1, plus=plus,
     )
     trainer = Trainer(cfg)
+    assert trainer.press.kvzip_plus_normalization == plus
     sample = trainer.data[0]
     ctx_ids, _, _, _ = trainer._batch(sample)
     trainer.press.compression_ratio = 0.9

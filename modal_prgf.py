@@ -5,8 +5,7 @@
     modal run --detach modal_prgf.py::evaluate --name kvzip --spec '{"method": "kvzip"}' --ratios 0.9,0.95 --split dev
     modal run modal_prgf.py::report --split dev                 # table of everything under /runs/results
 
-GPU budget: every GPU function is capped (max_containers) so that one data/eval job plus one training
-job never exceed 4 concurrent A100s. Run at most one evaluate job at a time.
+GPU budget: every GPU function is capped at one container; run one GPU job at a time (--n-shards 1).
 """
 
 import json
@@ -43,7 +42,7 @@ vllm_image = (
 
 
 # ----------------------------------------------------------------------------- data
-@app.function(image=vllm_image, gpu="A100-80GB", volumes=volumes, timeout=4 * 3600, max_containers=2)
+@app.function(image=vllm_image, gpu="A100-80GB", volumes=volumes, timeout=4 * 3600, max_containers=1)
 def generate_qa_shard(items: list[dict]) -> list[dict]:
     from transformers import AutoTokenizer
     from vllm import LLM
@@ -85,8 +84,28 @@ def build_data(n_longalpaca: int = 1200, n_pg19: int = 1000, n_flan: int = 500, 
     build_data_remote.remote(n_longalpaca, n_pg19, n_flan, shards, seed)
 
 
+# ----------------------------------------------------------------------------- cache warm-up (CPU only)
+@app.function(image=kv_image, volumes=volumes, cpu=4, memory=16384, timeout=2 * 3600)
+def prefetch_remote() -> str:
+    """Download model, official RestoreKV adapters and RULER into the HF cache volume without holding a GPU."""
+    from huggingface_hub import snapshot_download
+
+    from prgf.evaluate import load_ruler
+
+    for repo in (MODEL, f"higokri/RestoreKV-{MODEL.split('/')[-1]}", f"higokri/RestoreKV-{MODEL.split('/')[-1]}_plus"):
+        snapshot_download(repo)
+    n = len(load_ruler("all"))
+    hf_cache.commit()
+    return f"cached {MODEL}, RestoreKV(+) adapters, RULER ({n} rows)"
+
+
+@app.local_entrypoint()
+def prefetch():
+    print(prefetch_remote.remote())
+
+
 # ----------------------------------------------------------------------------- training
-@app.function(image=kv_image, gpu="A100-80GB", volumes=volumes, timeout=24 * 3600, max_containers=2)
+@app.function(image=kv_image, gpu="A100-80GB", volumes=volumes, timeout=24 * 3600, max_containers=1)
 def train_remote(cfg: dict):
     from prgf.train import TrainConfig, Trainer, latest_checkpoint
 
@@ -104,12 +123,14 @@ def train(
     seed: int = 0, init_adapter: str = "", exchange_from: float = -1.0, warmup_steps: int = 50, save_every: int = 500,
     recon_weight: float = 0.0, recon_span: int = 64, slots_per_region: int = 1, num_global: int = 1,
     transport: bool = False, transport_tau: float = 0.1, transport_lambda_v: float = 1.0, query_moment: str = "",
+    plus: bool = False,
 ):
     cfg = dict(
         data_path=f"{RUNS}/data/train.jsonl", output_dir=f"{RUNS}/ckpt/{name}", model=MODEL,
         mask_mode=mask_mode, steps=steps, lr=lr, max_answer_tokens=max_answer_tokens, seed=seed,
         init_adapter=init_adapter or None, exchange_from=exchange_from if exchange_from >= 0 else None,
-        warmup_steps=warmup_steps, save_every=save_every, score_cache_dir=f"{RUNS}/data/kvzip_scores",
+        warmup_steps=warmup_steps, save_every=save_every, plus=plus,
+        score_cache_dir=f"{RUNS}/data/{'kvzip_plus_scores' if plus else 'kvzip_scores'}",
         recon_weight=recon_weight, recon_span=recon_span, slots_per_region=slots_per_region, num_global=num_global,
         transport=transport, transport_tau=transport_tau, transport_lambda_v=transport_lambda_v,
         query_moment=query_moment or None,
@@ -119,7 +140,7 @@ def train(
 
 
 # ----------------------------------------------------------------------------- evaluation
-@app.cls(image=kv_image, gpu="A100", volumes=volumes, timeout=6 * 3600, max_containers=2)
+@app.cls(image=kv_image, gpu="A100", volumes=volumes, timeout=6 * 3600, max_containers=1)
 class Evaluator:
     @modal.enter()
     def load(self):

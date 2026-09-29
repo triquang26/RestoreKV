@@ -117,8 +117,10 @@ predictions on the same rows:
 |---|---|---|---|---|---|
 | test:50 | 83.20 | 86.33 | 84.48 | 84.78 | **85.12** |
 
-v4 step 1000 - RestoreKV = +1.92 [+0.25, +3.73]; - RestoreKV+ = -1.21 [-3.21, +0.76] (the gap is cwe: 47 vs 80,
-an effect of the KVzip+ scorer); - PRGF v1 = +0.64 [-0.86, +2.21].
+v4 step 1000 - RestoreKV = +1.92 [+0.25, +3.73]; - RestoreKV+ = -1.21 [-3.21, +0.76]; - PRGF v1 = +0.64 [-0.86, +2.21].
+The gap to RestoreKV+ is concentrated in cwe (47 vs 80, i.e. -33/13 = -2.54 points of average; the other 12 tasks
+give +1.33). Whether this is due to the KVzip+ scorer is not established by these runs, since the restore model also
+differs; the scorer-swap control is below.
 
 ## Transport write (conserving merge of evicted KV), zero-shot on v4 step 1000
 
@@ -132,7 +134,37 @@ error under calibrated G = E[qq^T/d] + value error), conserving weighted merge, 
 | + transport write (+ log m) | 65.62 | 18.0 | 70.0 | 60.0 | 48.8 | 60.0 | 50.0 | 25.0 |
 | + transport write, no mass bias | 50.94 | 23.0 | 46.7 | 40.0 | 25.0 | 45.0 | 60.0 | 20.0 |
 
-Removing the mass term makes it worse, so the loss is not the log-mass weighting: replacing the learned slot KV by
-averages of ~240 evicted tokens per slot and head removes the information the slots carry (the failure mode
-anticipated for averaging). Fine-tuning only changes the assignment (through the PRGF initialisation), not the
-merged representation, so the pure-merge write was not trained further.
+What this ablation shows: substituting the learned slots by the transport write, without training, costs 17.6
+points, and in this configuration the log-mass term helps (removing it costs another 14.7). It does not show that
+averaging alone is the cause, nor that training could not recover: assignment, temperature, initialisation and the
+abrupt change of representation are confounded, and the assignment was never trained.
+
+A structural limitation of any merge that stores only (mu, nu, m) per slot: with p_t = P_jt / m_j, the content a
+query reads from the merged group is a_j(q) = E_p[exp(q.k/sqrt d) v] / E_p[exp(q.k/sqrt d)]
+= nu + Cov_p(v, k) q / sqrt d + O(|q|^2), while the merged slot always returns nu. The key-value covariance, i.e.
+which value to return when the query leans toward which key, is lost at first order (conserving sum k and sum v does
+not conserve sum v k^T). Example: merging (u, w) and (-u, -w) gives mu = nu = 0 and a slot returning 0, whereas the
+group returns w tanh(q.u / sqrt d). No scalar mass correction can recover this. Mass itself is not over-counted:
+by Jensen, sum_j m_j exp(q.mu_j / sqrt d) <= sum_{j,t} P_jt exp(q.k_t / sqrt d), so the merged cache under-weights
+the evicted mass at a given query; the harm is mass attached to values that no longer respond to the query.
+
+Decision: the overwrite-by-transport branch is closed (no pilot, no statistics tokens); v4 remains the main result.
+
+## Round 4: scorer-swap control and PRGF on KVzip+ (16x)
+
+Same restore model (v4 step 1000, trained on KVzip selections), eviction scored with KVzip+ instead of KVzip,
+no retraining. dev:20 (260 samples), cr = 0.9375, paired against the leaderboard predictions on the same rows:
+
+| | average | cwe | fwe | multikey_1 | multiquery | multivalue | single_2 | single_3 | qa_1 | qa_2 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| full cache | 94.06 | 99.5 | 98.3 | 100 | 100 | 100 | 100 | 100 | 80 | 45 |
+| RestoreKV | 78.54 | 43.5 | 80.0 | 80 | 97.5 | 65.0 | 75 | 85 | 70 | 30 |
+| RestoreKV+ | 84.02 | 76.5 | 88.3 | 75 | 95.0 | 77.5 | 95 | 85 | 70 | 30 |
+| PRGF v4 (KVzip) | 83.25 | 48.0 | 81.7 | 95 | 93.8 | 68.8 | 95 | 85 | 75 | 40 |
+| **PRGF v4 (KVzip+, zero-shot)** | **87.28** | 70.5 | 91.7 | 80 | 96.2 | 86.2 | 100 | 90 | 75 | 45 |
+
+(multikey_2/3, single_1 and vt are at 100 for all compressed methods except RestoreKV multikey_3 = 95.)
+
+PRGF v4 (KVzip+) - RestoreKV+ = +3.26 [+0.76, +5.85]; - PRGF v4 (KVzip) = +4.04 [+1.66, +6.35].
+The scorer swap on a fixed restore model moves cwe from 48.0 to 70.5, so most of the cwe gap to RestoreKV+ is the
+scorer; KVzip+ costs multikey_1 for both restore models (95 -> 80 here, 80 -> 75 for RestoreKV -> RestoreKV+).
