@@ -3,8 +3,8 @@
 Protocol (identical for every method):
   * dataset ``simonjegou/ruler`` / 4096, the one used by the KVPress leaderboard;
   * fixed split: ``dev`` = first ``DEV_PER_TASK`` rows of each task after a seeded shuffle (used for
-    iterating), ``test`` = the remaining rows (only used for final numbers), ``test:K`` = the first K
-    test rows of each task (same shuffle; a cheaper held-out set), ``all`` = everything;
+    iterating), ``test`` = the remaining rows (only used for final numbers), ``test:K`` / ``dev:K`` = the
+    first K rows of each task of that split (same shuffle; cheaper screening sets), ``all`` = everything;
   * rows grouped by context and answered by ``pipe(context, questions=..., answer_prefix=...)`` exactly as
     kvpress/evaluation/evaluate.py does; greedy decoding with the task's max_new_tokens;
   * SDPA attention and bf16 for all methods; score = kvpress' RULER string-match metric, averaged over tasks.
@@ -30,13 +30,14 @@ def load_ruler(split: str) -> pd.DataFrame:
     if split == "all":
         return df
     split, _, per_task = split.partition(":")
+    assert split in ("dev", "test"), split
+    k = int(per_task) if per_task else None
     rng = np.random.default_rng(SPLIT_SEED)
-    dev_idx, test_idx = [], []
+    rows = []
     for _, g in df.groupby("task", sort=True):
         order = rng.permutation(g.index.to_numpy())
-        dev_idx += list(order[:DEV_PER_TASK])
-        test_idx += list(order[DEV_PER_TASK:][: int(per_task) if per_task else None])
-    return df.loc[sorted(dev_idx if split == "dev" else test_idx)]
+        rows += list((order[:DEV_PER_TASK] if split == "dev" else order[DEV_PER_TASK:])[:k])
+    return df.loc[sorted(rows)]
 
 
 def make_press(spec: dict, compression_ratio: float):
@@ -54,7 +55,8 @@ def make_press(spec: dict, compression_ratio: float):
         return RestoreKVPress(compression_ratio=compression_ratio, kvzip_plus_normalization=plus)
     mode = spec.get("mask_mode", "prgf" if method == "prgf" else "causal")
     return PartitionedRestoreKVPress(
-        compression_ratio=compression_ratio, kvzip_plus_normalization=plus, adapter=spec.get("adapter"), mask_mode=mode
+        compression_ratio=compression_ratio, kvzip_plus_normalization=plus, adapter=spec.get("adapter"), mask_mode=mode,
+        exchange_from=spec.get("exchange_from"),
     )
 
 

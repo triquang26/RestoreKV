@@ -10,7 +10,7 @@ from kvpress import KVzipPress, RestoreKVPress
 from safetensors.torch import load_file
 from transformers import PreTrainedModel
 
-from prgf.masking import MaskMode, attention_bias, restore_pass_provider
+from prgf.masking import MaskMode, attention_bias, exchange_layer, restore_pass_provider
 
 EMBEDDINGS_FILE = "restore_embeddings.safetensors"
 
@@ -74,12 +74,15 @@ class PartitionedRestoreKVPress(RestoreKVPress):
         Defaults to the official RestoreKV checkpoint of the model.
     mask_mode : {"prgf", "causal"}
         "causal" gives the original RestoreKV access pattern (useful for controls / ablations).
+    exchange_from : float, optional
+        PRGF v2: from layer floor(exchange_from * L) on, local slots also read the global slot.
     selection_only : bool
         Stop after eviction selection and expose ``kept_mask`` (used by the trainer).
     """
 
     adapter: str | None = None
     mask_mode: MaskMode = "prgf"
+    exchange_from: float | None = None
     selection_only: bool = False
     kept_mask: torch.Tensor | None = field(init=False, default=None, repr=False)
     scores: torch.Tensor | None = field(init=False, default=None, repr=False)  # KVzip scores of the last context
@@ -125,7 +128,10 @@ class PartitionedRestoreKVPress(RestoreKVPress):
             return super().append_restore_tokens(model)  # exact original RestoreKV code path
         assert model.config._attn_implementation == "sdpa", "PRGF masks are implemented for SDPA attention"
         num_groups = model.config.num_attention_heads // model.config.num_key_value_heads
-        provider = restore_pass_provider(self.kept_mask, self.num_restore_tokens, num_groups, self.mask_mode)
+        provider = restore_pass_provider(
+            self.kept_mask, self.num_restore_tokens, num_groups, self.mask_mode,
+            exchange_layer(model.config.num_hidden_layers, self.exchange_from),
+        )
         with attention_bias(provider):
             super().append_restore_tokens(model)
 

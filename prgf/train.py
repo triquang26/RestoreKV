@@ -24,7 +24,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
 from prgf import speedups
 from prgf.data import kvpress_inputs
-from prgf.masking import MaskMode, attention_bias, restore_pass_provider, student_pass_provider
+from prgf.masking import MaskMode, attention_bias, exchange_layer, restore_pass_provider, student_pass_provider
 from prgf.press import EMBEDDINGS_FILE, PartitionedRestoreKVPress
 
 
@@ -35,6 +35,7 @@ class TrainConfig:
     model: str = "Qwen/Qwen3-8B"
     init_adapter: str | None = None  # None -> official RestoreKV checkpoint of `model`
     mask_mode: MaskMode = "prgf"
+    exchange_from: float | None = None  # PRGF v2: local slots read G from layer floor(exchange_from * L)
     steps: int = 2000
     lr: float = 1e-4
     warmup_steps: int = 50
@@ -213,7 +214,11 @@ class Trainer:
         restore_cache = _cache_from(ctx_kv)
         self._adapters(True)
         try:
-            with attention_bias(restore_pass_provider(kept, n, self.num_groups, self.cfg.mask_mode)):
+            provider = restore_pass_provider(
+                kept, n, self.num_groups, self.cfg.mask_mode,
+                exchange_layer(model.config.num_hidden_layers, self.cfg.exchange_from),
+            )
+            with attention_bias(provider):
                 model.model(
                     inputs_embeds=self.embeddings.to(model.dtype)[None],
                     past_key_values=restore_cache, position_ids=pos[None], cache_position=pos, use_cache=True,

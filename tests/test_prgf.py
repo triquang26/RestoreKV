@@ -150,3 +150,35 @@ def test_restore_mask_batched_over_layers_matches_per_layer():
     for mode in ("prgf", "causal"):
         batched = restore_allowed(kept, N_RESTORE, mode)
         assert torch.equal(batched, torch.stack([restore_allowed(k, N_RESTORE, mode) for k in kept]))
+
+
+def test_exchange_mask_opens_only_local_to_global_in_late_layers():
+    kept = torch.rand(6, 2, 31) < 0.3
+    n, t = N_RESTORE, 31
+    v1 = restore_pass_provider(kept, n, 1, "prgf")
+    v2 = restore_pass_provider(kept, n, 1, "prgf", exchange_from_layer=4)
+    for layer in range(6):
+        a, b = v1(layer, n, t + n), v2(layer, n, t + n)
+        if layer < 4:
+            assert torch.equal(a, b)
+        else:
+            diff = (a != b).nonzero().tolist()  # (batch, head, query, key)
+            assert {(q, k) for _, _, q, k in diff} == {(j, t + n - 1) for j in range(n - 1)}
+            assert b[..., : n - 1, t + n - 1].all() and not a[..., : n - 1, t + n - 1].any()
+
+
+def test_exchange_lets_locals_see_other_regions_through_global(model):
+    cache = _prefill(model, length=42)
+    t, n = cache.get_seq_length(), N_RESTORE
+    emb = torch.randn(n, model.config.hidden_size)
+    kept = torch.zeros(model.config.num_hidden_layers, 2, t, dtype=torch.bool)
+    kept[..., :4] = True
+    target = int((region_ids(t, n - 1) == 3).nonzero()[0])
+    perturbed = copy.deepcopy(cache)
+    for layer in perturbed.layers:
+        layer.keys[:, :, target] += 3.0
+        layer.values[:, :, target] += 3.0
+    provider = restore_pass_provider(kept, n, 2, "prgf", exchange_from_layer=1)
+    base, _ = _restore_pass(model, cache, emb, provider)
+    out, _ = _restore_pass(model, perturbed, emb, provider)
+    assert ((out - base).abs().amax(-1) > 1e-6).all()  # every local slot now receives region-3 info via G

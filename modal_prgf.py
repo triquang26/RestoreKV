@@ -98,12 +98,14 @@ def train_remote(cfg: dict):
 
 @app.local_entrypoint()
 def train(
-    name: str, mask_mode: str = "prgf", steps: int = 2000, lr: float = 1e-4, max_answer_tokens: int = 256, seed: int = 0
+    name: str, mask_mode: str = "prgf", steps: int = 2000, lr: float = 1e-4, max_answer_tokens: int = 256,
+    seed: int = 0, init_adapter: str = "", exchange_from: float = -1.0, warmup_steps: int = 50, save_every: int = 500,
 ):
     cfg = dict(
         data_path=f"{RUNS}/data/train.jsonl", output_dir=f"{RUNS}/ckpt/{name}", model=MODEL,
         mask_mode=mask_mode, steps=steps, lr=lr, max_answer_tokens=max_answer_tokens, seed=seed,
-        score_cache_dir=f"{RUNS}/data/kvzip_scores",
+        init_adapter=init_adapter or None, exchange_from=exchange_from if exchange_from >= 0 else None,
+        warmup_steps=warmup_steps, save_every=save_every, score_cache_dir=f"{RUNS}/data/kvzip_scores",
     )
     train_remote.remote(cfg)
 
@@ -174,7 +176,9 @@ def evaluate_remote(name: str, spec: dict, ratios: list[float], split: str, n_sh
         os.makedirs(out_dir, exist_ok=True)
         with open(f"{out_dir}/{r}.json", "w") as f:
             json.dump(metrics, f, indent=2)
-        res[["task", "question", "answer", "predicted_answer"]].to_json(f"{out_dir}/{r}_preds.jsonl", orient="records", lines=True)
+        res.reset_index()[["index", "task", "question", "answer", "predicted_answer"]].to_json(
+            f"{out_dir}/{r}_preds.jsonl", orient="records", lines=True
+        )
         summary[r] = metrics["average"]
         print(f"{name} ratio={r} {split}: {metrics['average']:.2f}  ({metrics['gpu_seconds'] / len(res):.2f} GPU-s/sample)")
     runs.commit()

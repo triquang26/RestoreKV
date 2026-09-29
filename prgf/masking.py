@@ -13,6 +13,8 @@ Two masks are needed:
     - local R_j : kept context  +  evicted context in region P_j  +  itself
     - global G  : whole context  +  R_1..R_{n-1}  +  itself
   (``mode="causal"`` reproduces the original RestoreKV access pattern: full context, causal slots.)
+    - PRGF v2 (``exchange_from_layer``): in the last layers R_j additionally reads G
+      ("local encoding followed by global exchange").
 * student pass (queries = question/answer tokens, keys = context + restore tokens + QA tokens)
     - kept context  +  all restore slots  +  causal over QA tokens
   i.e. exactly what the model sees after eviction, used for self-distillation.
@@ -112,10 +114,25 @@ def _to_query_heads(allowed: torch.Tensor, num_groups: int) -> torch.Tensor:
     return allowed.repeat_interleave(num_groups, dim=0)[None]
 
 
-def restore_pass_provider(kept: torch.Tensor, num_restore: int, num_groups: int, mode: MaskMode) -> MaskProvider:
-    """kept: (num_layers, num_kv_heads, T) bool. Masks of all layers are built at once (a few kernels)."""
+def exchange_layer(num_layers: int, exchange_from: float | None) -> int | None:
+    """First layer of the local-global exchange stage: floor(exchange_from * L) (None = PRGF v1)."""
+    return None if exchange_from is None else int(exchange_from * num_layers)
+
+
+def restore_pass_provider(
+    kept: torch.Tensor, num_restore: int, num_groups: int, mode: MaskMode, exchange_from_layer: int | None = None
+) -> MaskProvider:
+    """kept: (num_layers, num_kv_heads, T) bool. Masks of all layers are built at once (a few kernels).
+
+    exchange_from_layer (PRGF v2): from this layer on, local slots also read the global slot G. G sits
+    after the locals, so this edge is anti-causal; it is legal because the whole restore block is built
+    from the context only (before any question), and Q/K/V of a layer come from that layer's inputs.
+    """
     context_length = kept.shape[-1]
     allowed = restore_allowed(kept, num_restore, mode)  # (L, H_kv, n, T + n)
+    if exchange_from_layer is not None:
+        assert mode == "prgf", "local-global exchange extends the PRGF mask"
+        allowed[exchange_from_layer:, :, : num_restore - 1, -1] = True  # R_j -> G
 
     def provider(layer_idx: int, q_len: int, k_len: int) -> torch.Tensor:
         assert q_len == num_restore and k_len == context_length + num_restore, (q_len, k_len)
