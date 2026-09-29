@@ -57,6 +57,23 @@ def prepare_press(press, model: PreTrainedModel):
         move_adapters_to_base_device(model)
 
 
+def expand_restore_embeddings(emb: torch.Tensor, slots_per_region: int, num_global: int, noise: float = 0.01) -> torch.Tensor:
+    """Grow a PRGF v1 layout [R locals, 1 global] into [R*k locals (k per region), g globals].
+
+    Each region's slot is copied k times and the global slot g times; copies get small noise (relative to
+    the embedding scale) so they can specialise.
+    """
+    n_regions = emb.shape[0] - 1
+    local = emb[:n_regions].repeat_interleave(slots_per_region, dim=0)
+    glob = emb[-1:].repeat(num_global, 1)
+    out = torch.cat([local, glob]).clone()
+    first = torch.zeros(out.shape[0], dtype=torch.bool)
+    first[torch.arange(n_regions) * slots_per_region] = True
+    first[n_regions * slots_per_region] = True
+    out[~first] += noise * emb.std() * torch.randn_like(out[~first])
+    return out
+
+
 @dataclass
 class PartitionedRestoreKVPress(RestoreKVPress):
     """RestoreKV with Partitioned Restore and Global Fusion.
@@ -75,7 +92,9 @@ class PartitionedRestoreKVPress(RestoreKVPress):
     mask_mode : {"prgf", "causal"}
         "causal" gives the original RestoreKV access pattern (useful for controls / ablations).
     exchange_from : float, optional
-        PRGF v2: from layer floor(exchange_from * L) on, local slots also read the global slot.
+        PRGF v2: from layer floor(exchange_from * L) on, local slots also read the global slots.
+    slots_per_region, num_global : int
+        Slot layout: k chained local slots per region and g global slots (v1: k = g = 1).
     selection_only : bool
         Stop after eviction selection and expose ``kept_mask`` (used by the trainer).
     """
@@ -83,6 +102,8 @@ class PartitionedRestoreKVPress(RestoreKVPress):
     adapter: str | None = None
     mask_mode: MaskMode = "prgf"
     exchange_from: float | None = None
+    slots_per_region: int = 1
+    num_global: int = 1
     selection_only: bool = False
     drop_slots_at_decode: bool = False  # diagnostics only: evict the restore slots again after building them
     kept_mask: torch.Tensor | None = field(init=False, default=None, repr=False)
@@ -146,7 +167,7 @@ class PartitionedRestoreKVPress(RestoreKVPress):
         num_groups = model.config.num_attention_heads // model.config.num_key_value_heads
         provider = restore_pass_provider(
             self.kept_mask, self.num_restore_tokens, num_groups, self.mask_mode,
-            exchange_layer(model.config.num_hidden_layers, self.exchange_from),
+            exchange_layer(model.config.num_hidden_layers, self.exchange_from), self.slots_per_region, self.num_global,
         )
         with attention_bias(provider):
             super().append_restore_tokens(model)

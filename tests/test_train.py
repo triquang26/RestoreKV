@@ -159,3 +159,19 @@ def test_reconstruction_pairs_are_region_local_context_spans(tiny):
     # QA tokens and reconstruction tokens each contribute a normalized mean (weights sum to 1 + recon_weight)
     torch.testing.assert_close(weights.sum(), torch.tensor(2.0), rtol=1e-5, atol=1e-5)
     trainer.train()  # runs end to end with the extra targets
+
+
+def test_train_chained_layout_from_v1_checkpoint(tiny):
+    root, tok = tiny
+    cfg = TrainConfig(data_path=str(root / "data.jsonl"), output_dir=str(root / "out_k2"), model=str(root / "model"),
+                      init_adapter=str(root / "adapter"), slots_per_region=2, num_global=2, recon_weight=1.0,
+                      recon_span=8, steps=2, warmup_steps=1)
+    trainer = Trainer(cfg)
+    assert trainer.num_restore == 16 and trainer.press.num_restore_tokens == 16  # budget pays for 16 slots
+    trainer.train()
+    model = Qwen3ForCausalLM.from_pretrained(root / "model", attn_implementation="sdpa")
+    pipe = pipeline("kv-press-text-generation", model=model, tokenizer=tok, device="cpu")
+    press = PartitionedRestoreKVPress(compression_ratio=0.8, adapter=f"{cfg.output_dir}/final", slots_per_region=2, num_global=2)
+    cache = DynamicCache()
+    pipe(" ".join(f"fact{i}" for i in range(150)), question="What?", press=press, cache=cache, max_new_tokens=2)
+    assert press.num_restore_tokens == 16

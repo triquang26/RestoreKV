@@ -78,10 +78,15 @@ def region_ids(context_length: int, num_regions: int, device=None) -> torch.Tens
     return torch.arange(context_length, device=device) * num_regions // context_length
 
 
-def restore_allowed(kept: torch.Tensor, num_restore: int, mode: MaskMode = "prgf") -> torch.Tensor:
+def restore_allowed(
+    kept: torch.Tensor, num_restore: int, mode: MaskMode = "prgf", slots_per_region: int = 1, num_global: int = 1
+) -> torch.Tensor:
     """Allowed-attention pattern of the restore tokens.
 
     kept: (..., num_kv_heads, T) bool, positions surviving eviction (any leading dims, e.g. layers).
+    Slot layout (prgf): [region 0: k slots, region 1: k slots, ..., globals: g slots]. A local slot reads the
+    kept cache, the evicted positions of its own region and the earlier slots of its own region (a causal
+    chain, k = 1: only itself); a global slot reads the full context and every earlier slot.
     Returns (..., num_kv_heads, n, T + n) bool.
     """
     *lead, context_length = kept.shape
@@ -89,11 +94,13 @@ def restore_allowed(kept: torch.Tensor, num_restore: int, mode: MaskMode = "prgf
     slots = torch.ones(n, n, dtype=torch.bool, device=device).tril()
     ctx = torch.ones(*lead, n, context_length, dtype=torch.bool, device=device)
     if mode == "prgf":
-        assert n >= 2, "PRGF needs at least one local slot and one global slot"
-        regions = region_ids(context_length, n - 1, device)
-        own_region = regions[None, :] == torch.arange(n - 1, device=device)[:, None]  # (n-1, T)
-        ctx[..., : n - 1, :] = kept[..., None, :] | own_region
-        slots[: n - 1] = torch.eye(n, dtype=torch.bool, device=device)[: n - 1]  # locals: only themselves
+        n_local = n - num_global
+        assert num_global >= 1 and n_local >= slots_per_region and n_local % slots_per_region == 0, (n, slots_per_region, num_global)
+        slot_region = torch.arange(n_local, device=device) // slots_per_region
+        regions = region_ids(context_length, n_local // slots_per_region, device)
+        own_region = regions[None, :] == slot_region[:, None]  # (n_local, T)
+        ctx[..., :n_local, :] = kept[..., None, :] | own_region
+        slots[:n_local, :n_local] &= slot_region[:, None] == slot_region[None, :]  # chains stay inside a region
     elif mode != "causal":
         raise ValueError(f"Unknown mask mode {mode!r}")
     return torch.cat([ctx, slots.expand(*lead, n, n)], dim=-1)
@@ -120,7 +127,8 @@ def exchange_layer(num_layers: int, exchange_from: float | None) -> int | None:
 
 
 def restore_pass_provider(
-    kept: torch.Tensor, num_restore: int, num_groups: int, mode: MaskMode, exchange_from_layer: int | None = None
+    kept: torch.Tensor, num_restore: int, num_groups: int, mode: MaskMode, exchange_from_layer: int | None = None,
+    slots_per_region: int = 1, num_global: int = 1,
 ) -> MaskProvider:
     """kept: (num_layers, num_kv_heads, T) bool. Masks of all layers are built at once (a few kernels).
 
@@ -129,10 +137,11 @@ def restore_pass_provider(
     from the context only (before any question), and Q/K/V of a layer come from that layer's inputs.
     """
     context_length = kept.shape[-1]
-    allowed = restore_allowed(kept, num_restore, mode)  # (L, H_kv, n, T + n)
+    allowed = restore_allowed(kept, num_restore, mode, slots_per_region, num_global)  # (L, H_kv, n, T + n)
     if exchange_from_layer is not None:
         assert mode == "prgf", "local-global exchange extends the PRGF mask"
-        allowed[exchange_from_layer:, :, : num_restore - 1, -1] = True  # R_j -> G
+        n_local = num_restore - num_global
+        allowed[exchange_from_layer:, :, :n_local, context_length + n_local :] = True  # locals -> globals
 
     def provider(layer_idx: int, q_len: int, k_len: int) -> torch.Tensor:
         assert q_len == num_restore and k_len == context_length + num_restore, (q_len, k_len)

@@ -212,3 +212,53 @@ def test_drop_slots_masks_exactly_the_restore_positions(model, adapter_dir):
         counts[drop] = (len(idx[2]), int((idx[2] >= cache.get_seq_length() - N_RESTORE).sum()))
     assert counts[True][0] - counts[False][0] == N_RESTORE * model.config.num_key_value_heads
     assert counts[False][1] == 0 and counts[True][1] == N_RESTORE * model.config.num_key_value_heads
+
+
+def test_chained_layout_mask_k2_g2():
+    k, g, n_regions, t = 2, 2, 7, 43
+    n = n_regions * k + g
+    kept = torch.rand(2, t) < 0.3
+    allowed = restore_allowed(kept, n, "prgf", slots_per_region=k, num_global=g)
+    regions = region_ids(t, n_regions)
+    for i in range(n_regions * k):
+        r = i // k
+        assert torch.equal(allowed[:, i, :t], kept | (regions == r))
+        expected = torch.zeros(n, dtype=torch.bool)
+        expected[r * k : i + 1] = True  # own chain up to itself
+        assert torch.equal(allowed[0, i, t:], expected)
+    for gi in range(g):
+        row = n_regions * k + gi
+        assert allowed[:, row, :t].all()
+        assert allowed[0, row, t : t + row + 1].all() and not allowed[0, row, t + row + 1 :].any()
+
+
+def test_chained_layout_isolation(model):
+    from prgf.press import expand_restore_embeddings
+
+    cache = _prefill(model, length=50)
+    t, k, g = cache.get_seq_length(), 2, 2
+    emb = expand_restore_embeddings(torch.randn(8, model.config.hidden_size), k, g)
+    n = emb.shape[0]
+    assert n == 16
+    kept = torch.zeros(model.config.num_hidden_layers, 2, t, dtype=torch.bool)
+    kept[..., :4] = True
+    provider = restore_pass_provider(kept, n, 2, "prgf", slots_per_region=k, num_global=g)
+    base, _ = _restore_pass(model, cache, emb, provider)
+    target = int((region_ids(t, 7) == 3).nonzero()[0])
+    perturbed = copy.deepcopy(cache)
+    for layer in perturbed.layers:
+        layer.keys[:, :, target] += 3.0
+        layer.values[:, :, target] += 3.0
+    out, _ = _restore_pass(model, perturbed, emb, provider)
+    changed = ((out - base).abs().amax(-1) > 1e-6).tolist()
+    assert changed == [i // k == 3 or i >= 14 for i in range(n)]  # region-3 chain + both globals
+
+
+def test_expand_embeddings_keeps_first_copies():
+    from prgf.press import expand_restore_embeddings
+
+    emb = torch.randn(8, 16)
+    out = expand_restore_embeddings(emb, 3, 2)
+    assert out.shape == (7 * 3 + 2, 16)
+    assert torch.equal(out[0::3][:7], emb[:7]) and torch.equal(out[21], emb[7])
+    assert not torch.equal(out[1], emb[0]) and torch.allclose(out[1], emb[0], atol=0.1)

@@ -27,7 +27,7 @@ from prgf.data import kvpress_inputs
 from prgf.masking import (
     MaskMode, attention_bias, exchange_layer, region_ids, restore_pass_provider, student_pass_provider,
 )
-from prgf.press import EMBEDDINGS_FILE, PartitionedRestoreKVPress
+from prgf.press import EMBEDDINGS_FILE, PartitionedRestoreKVPress, expand_restore_embeddings
 
 
 @dataclass
@@ -38,6 +38,8 @@ class TrainConfig:
     init_adapter: str | None = None  # None -> official RestoreKV checkpoint of `model`
     mask_mode: MaskMode = "prgf"
     exchange_from: float | None = None  # PRGF v2: local slots read G from layer floor(exchange_from * L)
+    slots_per_region: int = 1  # k chained local slots per region (v1 checkpoints are expanded on load)
+    num_global: int = 1
     steps: int = 2000
     lr: float = 1e-4
     warmup_steps: int = 50
@@ -123,8 +125,16 @@ class Trainer:
         for p in self.lora:  # fp32 master weights (PEFT casts activations to the adapter dtype)
             p.data = p.data.float()
             p.requires_grad_(True)
-        self.embeddings = torch.nn.Parameter(self.press.restore_embeddings.float().clone())
+        embeddings = self.press.restore_embeddings.float()
+        k, g = cfg.slots_per_region, cfg.num_global
+        if (k, g) != (1, 1) and embeddings.shape[0] == 8 and cfg.resume_from is None:  # start from a v1 layout
+            embeddings = expand_restore_embeddings(embeddings, k, g)
+        self.press.restore_embeddings = embeddings.to(self.model.dtype)  # budget matching pays for every slot
+        self.press.slots_per_region, self.press.num_global = k, g
+        self.embeddings = torch.nn.Parameter(embeddings.clone())
         self.num_restore = self.embeddings.shape[0]
+        self.num_regions = (self.num_restore - g) // k
+        assert self.num_regions * k + g == self.num_restore, (self.num_restore, k, g)
 
         params = [self.embeddings, *self.lora]
         self.optim = torch.optim.AdamW(params, lr=cfg.lr, betas=(0.9, 0.999), weight_decay=cfg.weight_decay)
@@ -175,9 +185,9 @@ class Trainer:
     RECON_QUESTION = "Repeat the part of the previous context exactly, starting with: {}"
 
     def _recon_pairs(self, ctx_ids: list[int]) -> list[tuple[list[int], list[int]]]:
-        """One (question, span) pair per local region: the span lies inside region j, whose evicted part
-        only local slot R_j can read, so its reconstruction error is attributable to that slot."""
-        T, n_local, span, pre = len(ctx_ids), self.num_restore - 1, self.cfg.recon_span, self.cfg.recon_prefix
+        """One (question, span) pair per region: the span lies inside region j, whose evicted part only the
+        local slots of region j can read, so its reconstruction error is attributable to them."""
+        T, n_local, span, pre = len(ctx_ids), self.num_regions, self.cfg.recon_span, self.cfg.recon_prefix
         regions = region_ids(T, n_local).tolist()
         questions, answers = [], []
         for j in range(n_local):
@@ -255,6 +265,7 @@ class Trainer:
             provider = restore_pass_provider(
                 kept, n, self.num_groups, self.cfg.mask_mode,
                 exchange_layer(model.config.num_hidden_layers, self.cfg.exchange_from),
+                self.cfg.slots_per_region, self.cfg.num_global,
             )
             with attention_bias(provider):
                 model.model(

@@ -102,14 +102,14 @@ def train_remote(cfg: dict):
 def train(
     name: str, mask_mode: str = "prgf", steps: int = 2000, lr: float = 1e-4, max_answer_tokens: int = 256,
     seed: int = 0, init_adapter: str = "", exchange_from: float = -1.0, warmup_steps: int = 50, save_every: int = 500,
-    recon_weight: float = 0.0, recon_span: int = 64,
+    recon_weight: float = 0.0, recon_span: int = 64, slots_per_region: int = 1, num_global: int = 1,
 ):
     cfg = dict(
         data_path=f"{RUNS}/data/train.jsonl", output_dir=f"{RUNS}/ckpt/{name}", model=MODEL,
         mask_mode=mask_mode, steps=steps, lr=lr, max_answer_tokens=max_answer_tokens, seed=seed,
         init_adapter=init_adapter or None, exchange_from=exchange_from if exchange_from >= 0 else None,
         warmup_steps=warmup_steps, save_every=save_every, score_cache_dir=f"{RUNS}/data/kvzip_scores",
-        recon_weight=recon_weight, recon_span=recon_span,
+        recon_weight=recon_weight, recon_span=recon_span, slots_per_region=slots_per_region, num_global=num_global,
     )
     call = train_remote.spawn(cfg)  # runs server-side; needs `modal run --detach`
     print(f"spawned {call.object_id}; checkpoints -> {cfg['output_dir']}")

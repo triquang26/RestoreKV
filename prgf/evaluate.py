@@ -59,7 +59,8 @@ def make_press(spec: dict, compression_ratio: float):
     mode = spec.get("mask_mode", "prgf" if method == "prgf" else "causal")
     return PartitionedRestoreKVPress(
         compression_ratio=compression_ratio, kvzip_plus_normalization=plus, adapter=spec.get("adapter"), mask_mode=mode,
-        exchange_from=spec.get("exchange_from"), drop_slots_at_decode=spec.get("drop_slots_at_decode", False), **extra,
+        exchange_from=spec.get("exchange_from"), drop_slots_at_decode=spec.get("drop_slots_at_decode", False),
+        slots_per_region=spec.get("slots_per_region", 1), num_global=spec.get("num_global", 1), **extra,
     )
 
 
