@@ -319,3 +319,24 @@ def diagnose(ratio: float = 0.9375, tasks: str = "niah_single_2,niah_multivalue,
     with open(out, "w") as f:
         json.dump(res, f)
     print(f"wrote {out}")
+
+
+# ----------------------------------------------------------------------------- server-side queue
+@app.function(image=kv_image, volumes=volumes, timeout=12 * 3600)
+def evaluate_when_ready(ckpt_dir: str, name: str, spec: dict, ratios: list[float], split: str, n_shards: int) -> dict:
+    """Wait (server-side, survives client restarts) until a checkpoint exists, then evaluate it."""
+    import os
+    import time
+
+    while True:
+        runs.reload()
+        if os.path.exists(os.path.join(ckpt_dir, "adapter_model.safetensors")):
+            break
+        time.sleep(120)
+    return evaluate_remote.remote(name, spec, ratios, split, n_shards)
+
+
+@app.local_entrypoint()
+def evaluate_later(ckpt: str, name: str, spec: str, ratios: str = "0.9375", split: str = "dev", n_shards: int = 2):
+    call = evaluate_when_ready.spawn(ckpt, name, json.loads(spec), [float(r) for r in ratios.split(",")], split, n_shards)
+    print(f"queued {call.object_id}: evaluates {ckpt} when it appears")
