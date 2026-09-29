@@ -101,3 +101,38 @@ evicted tokens. 500 steps from PRGF v1 (`recon_weight=1`), dev single_2 + multiv
 | + reconstruction (500 steps) | 94.5 | 59.8 | 100 | 94.4 | 86.56 |
 
 +1.25 [-0.62, +3.12] (paired bootstrap), 5 samples better / 2 worse: right direction, not yet significant.
+
+## Round 3: reconstruction distillation + chained slots (16x)
+
+Dev (520 samples), cr = 0.9375:
+
+| | RestoreKV | RestoreKV+ | PRGF v1 | v3 (recon) step 1000 | v3 final | v4 (2 slots/region, 2 globals, recon) step 1000 | v4 final |
+|---|---|---|---|---|---|---|---|
+| average | 81.26 | 84.46 | 83.40 | 84.56 | 84.38 | **84.61** | 83.98 |
+
+Both runs peak around step 1000 and then lose QA accuracy. Held-out test (650 samples), paired vs the leaderboard
+predictions on the same rows:
+
+| | RestoreKV | RestoreKV+ | PRGF v1 | v3 step 1000 | **v4 step 1000** |
+|---|---|---|---|---|---|
+| test:50 | 83.20 | 86.33 | 84.48 | 84.78 | **85.12** |
+
+v4 step 1000 - RestoreKV = +1.92 [+0.25, +3.73]; - RestoreKV+ = -1.21 [-3.21, +0.76] (the gap is cwe: 47 vs 80,
+an effect of the KVzip+ scorer); - PRGF v1 = +0.64 [-0.86, +2.21].
+
+## Transport write (conserving merge of evicted KV), zero-shot on v4 step 1000
+
+`prgf/transport.py`: scope-restricted entropic assignment of evicted KV to the 16 slots (cost = expected logit
+error under calibrated G = E[qq^T/d] + value error), conserving weighted merge, 2 rounds, slots attend with
++ log(mass). dev:20 (260 samples), cr = 0.9375:
+
+| | average | cwe | fwe | multikey_1 | multivalue | single_2 | qa_1 | qa_2 |
+|---|---|---|---|---|---|---|---|---|
+| v4 step 1000 (learned slots) | **83.24** | 48.0 | 81.7 | 95.0 | 68.8 | 95.0 | 75.0 | 40.0 |
+| + transport write (+ log m) | 65.62 | 18.0 | 70.0 | 60.0 | 48.8 | 60.0 | 50.0 | 25.0 |
+| + transport write, no mass bias | 50.94 | 23.0 | 46.7 | 40.0 | 25.0 | 45.0 | 60.0 | 20.0 |
+
+Removing the mass term makes it worse, so the loss is not the log-mass weighting: replacing the learned slot KV by
+averages of ~240 evicted tokens per slot and head removes the information the slots carry (the failure mode
+anticipated for averaging). Fine-tuning only changes the assignment (through the PRGF initialisation), not the
+merged representation, so the pure-merge write was not trained further.
