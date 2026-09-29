@@ -71,3 +71,33 @@ The PRGF gain grows as the budget shrinks: +0.9 (10%, dev), +1.3 (6.25%, test vs
 prefill ~340 ms; compression (KVzip scoring + restore pass) 1.12 s RestoreKV vs 1.18 s PRGF;
 decoding identical (~75 ms/token, dominated by kvpress' fake-eviction key search).
 Training: ~0.36 it/s on one A100-80GB with cached KVzip scores (2000 steps ~ 1.5 h).
+
+## Diagnostics at 16x (why PRGF loses points)
+
+Error analysis on the held-out rows plus counterfactual runs (all at cr = 0.9375):
+
+- Three tasks carry most of the loss vs full cache: cwe (-51), niah_multivalue (-26), niah_single_2 (-20).
+- The restore slots carry the needle tasks: on single_2 + multivalue, KVzip alone scores 44.0 and PRGF with its
+  slots dropped at decode 40.8, vs 77.2 for RestoreKV on the same rows.
+- Needles in the second half of the context are much harder for every method, including KVzip without restore
+  (multivalue 46 -> 29, single_2 89 -> 36). Eviction itself is uniform across regions and KVzip chunks (kept
+  5.7-6.5 % everywhere, equal chunk scores), and needle-value tokens are kept at the same ~6 % rate as filler,
+  before or after the chunk boundary, for solved and failed samples alike. KVzip does not favour needles at 16x;
+  answers rely on residual fragments plus the restore slots.
+- cwe: max-attention reconstruction scoring splits attention over repeated words, so the frequent words (the
+  answer) are evicted first; PRGF recovers 4.6/10 words, with the wrong ones essentially random.
+- Ruled out: region partitioning by evicted mass (eviction is uniform, so it equals the current partition) and
+  a chunk-dependent eviction bias.
+
+### Partitioned reconstruction distillation (pilot)
+
+Each step adds one evicted-region span per local slot ("Repeat the part ... starting with: <prefix>"), distilled
+from the full cache; the error on region j is attributable to slot R_j because only it reads that region's
+evicted tokens. 500 steps from PRGF v1 (`recon_weight=1`), dev single_2 + multivalue at cr = 0.9375:
+
+| | multivalue early | multivalue late | single_2 early | single_2 late | average |
+|---|---|---|---|---|---|
+| PRGF v1 | 91.8 | 57.5 | 100 | 94.4 | 85.31 |
+| + reconstruction (500 steps) | 94.5 | 59.8 | 100 | 94.4 | 86.56 |
+
++1.25 [-0.62, +3.12] (paired bootstrap), 5 samples better / 2 worse: right direction, not yet significant.
