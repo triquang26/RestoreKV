@@ -161,10 +161,15 @@ no retraining. dev:20 (260 samples), cr = 0.9375, paired against the leaderboard
 | RestoreKV | 78.54 | 43.5 | 80.0 | 80 | 97.5 | 65.0 | 75 | 85 | 70 | 30 |
 | RestoreKV+ | 84.02 | 76.5 | 88.3 | 75 | 95.0 | 77.5 | 95 | 85 | 70 | 30 |
 | PRGF v4 (KVzip) | 83.25 | 48.0 | 81.7 | 95 | 93.8 | 68.8 | 95 | 85 | 75 | 40 |
-| **PRGF v4 (KVzip+, zero-shot)** | **87.28** | 70.5 | 91.7 | 80 | 96.2 | 86.2 | 100 | 90 | 75 | 45 |
+| PRGF v4 (KVzip+, zero-shot) | 87.28 | 70.5 | 91.7 | 80 | 96.2 | 86.2 | 100 | 90 | 75 | 45 |
+| **PRGF v4+ (600 steps on KVzip+ selections)** | **87.65** | 72.0 | 95.0 | 85 | 97.5 | 85.0 | 100 | 90 | 70 | 45 |
 
 (multikey_2/3, single_1 and vt are at 100 for all compressed methods except RestoreKV multikey_3 = 95.)
 
 PRGF v4 (KVzip+) - RestoreKV+ = +3.26 [+0.76, +5.85]; - PRGF v4 (KVzip) = +4.04 [+1.66, +6.35].
 The scorer swap on a fixed restore model moves cwe from 48.0 to 70.5, so most of the cwe gap to RestoreKV+ is the
 scorer; KVzip+ costs multikey_1 for both restore models (95 -> 80 here, 80 -> 75 for RestoreKV -> RestoreKV+).
+
+Fine-tuning v4 step 1000 on KVzip+ selections (600 steps, lr 5e-5, recon_weight 1, same 16-slot layout):
+v4+ - RestoreKV+ = +3.63 [+1.28, +6.19]; - PRGF v4 (KVzip) = +4.41 [+2.26, +6.47]; - zero-shot = +0.37 [-0.92, +1.68]
+(adaptation to the new selection is within noise; the scorer swap carries the gain). Held-out test:50 pending.
