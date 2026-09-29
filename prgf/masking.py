@@ -1,0 +1,135 @@
+"""Hard attention masks for Partitioned Restore with Global Fusion (PRGF).
+
+HF attention masks are shared by all layers and heads, but PRGF needs a different mask per
+(layer, KV head) because the evictor keeps a different set of positions in each. We therefore
+route SDPA through a small wrapper: inside ``attention_bias(provider)`` every attention layer asks
+``provider(layer_idx, q_len, k_len)`` for a boolean mask of shape (1, num_heads, q_len, k_len)
+(True = may attend) and calls the stock transformers SDPA kernel with it. Outside the context
+manager the wrapper is a no-op.
+
+Two masks are needed:
+
+* restore pass (queries = n restore tokens [R_1..R_{n-1}, G], keys = context + restore tokens)
+    - local R_j : kept context  +  evicted context in region P_j  +  itself
+    - global G  : whole context  +  R_1..R_{n-1}  +  itself
+  (``mode="causal"`` reproduces the original RestoreKV access pattern: full context, causal slots.)
+* student pass (queries = question/answer tokens, keys = context + restore tokens + QA tokens)
+    - kept context  +  all restore slots  +  causal over QA tokens
+  i.e. exactly what the model sees after eviction, used for self-distillation.
+"""
+
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Callable, Literal
+
+import kvpress  # noqa: F401  (patches ALL_ATTENTION_FUNCTIONS first; we wrap on top of it)
+import torch
+from torch.utils.checkpoint import checkpoint
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+MaskMode = Literal["prgf", "causal"]
+MaskProvider = Callable[[int, int, int], torch.Tensor]
+
+_PROVIDER: ContextVar[MaskProvider | None] = ContextVar("prgf_mask_provider", default=None)
+
+
+@contextmanager
+def attention_bias(provider: MaskProvider):
+    """Use ``provider`` for every SDPA call made inside the block."""
+    token = _PROVIDER.set(provider)
+    try:
+        yield
+    finally:
+        _PROVIDER.reset(token)
+
+
+def _install():
+    previous = ALL_ATTENTION_FUNCTIONS["sdpa"]
+    if getattr(previous, "_prgf", False):
+        return
+
+    def sdpa_with_bias(module, query, key, value, attention_mask, *args, **kwargs):
+        provider = _PROVIDER.get()
+        if provider is None:
+            return previous(module, query, key, value, attention_mask, *args, **kwargs)
+
+        def attend(q, k, v):
+            mask = provider(module.layer_idx, q.shape[-2], k.shape[-2])
+            # Stock kernel (not the kvpress fake-key patch): keys stay untouched during these passes.
+            return sdpa_attention_forward(module, q, k, v, mask, *args, **kwargs)[0]
+
+        if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad):
+            # The dense mask is (num_heads, q_len, k_len); recompute it in backward instead of storing it.
+            return checkpoint(attend, query, key, value, use_reentrant=False), None
+        return attend(query, key, value), None
+
+    sdpa_with_bias._prgf = True
+    ALL_ATTENTION_FUNCTIONS["sdpa"] = sdpa_with_bias
+
+
+_install()
+
+
+def region_ids(context_length: int, num_regions: int, device=None) -> torch.Tensor:
+    """P_j = {t : floor(num_regions * t / T) = j}: contiguous, near-equal regions by token position."""
+    return torch.arange(context_length, device=device) * num_regions // context_length
+
+
+def restore_allowed(kept: torch.Tensor, num_restore: int, mode: MaskMode = "prgf") -> torch.Tensor:
+    """Allowed-attention pattern of the restore tokens.
+
+    kept: (num_kv_heads, T) bool, positions surviving eviction for one layer.
+    Returns (num_kv_heads, n, T + n) bool.
+    """
+    num_kv_heads, context_length = kept.shape
+    n, device = num_restore, kept.device
+    slots = torch.ones(n, n, dtype=torch.bool, device=device).tril()
+    if mode == "causal":
+        ctx = torch.ones(num_kv_heads, n, context_length, dtype=torch.bool, device=device)
+    elif mode == "prgf":
+        assert n >= 2, "PRGF needs at least one local slot and one global slot"
+        regions = region_ids(context_length, n - 1, device)
+        own_region = regions[None, :] == torch.arange(n - 1, device=device)[:, None]  # (n-1, T)
+        ctx = torch.ones(num_kv_heads, n, context_length, dtype=torch.bool, device=device)
+        ctx[:, : n - 1] = kept[:, None, :] | own_region[None]
+        slots[: n - 1] = torch.eye(n, dtype=torch.bool, device=device)[: n - 1]  # locals: only themselves
+    else:
+        raise ValueError(f"Unknown mask mode {mode!r}")
+    return torch.cat([ctx, slots[None].expand(num_kv_heads, n, n)], dim=-1)
+
+
+def student_allowed(kept: torch.Tensor, num_restore: int, q_len: int) -> torch.Tensor:
+    """QA tokens after compression: kept context + all restore slots + causal QA. (num_kv_heads, q_len, T+n+q_len)."""
+    num_kv_heads, _ = kept.shape
+    device = kept.device
+    ctx = kept[:, None, :].expand(-1, q_len, -1)
+    slots = torch.ones(num_kv_heads, q_len, num_restore, dtype=torch.bool, device=device)
+    qa = torch.ones(q_len, q_len, dtype=torch.bool, device=device).tril()[None].expand(num_kv_heads, -1, -1)
+    return torch.cat([ctx, slots, qa], dim=-1)
+
+
+def _to_query_heads(allowed: torch.Tensor, num_groups: int) -> torch.Tensor:
+    # KV head h serves query heads h*G .. h*G+G-1 (same order as transformers' repeat_kv)
+    return allowed.repeat_interleave(num_groups, dim=0)[None]
+
+
+def restore_pass_provider(kept: torch.Tensor, num_restore: int, num_groups: int, mode: MaskMode) -> MaskProvider:
+    """kept: (num_layers, num_kv_heads, T) bool."""
+    context_length = kept.shape[-1]
+
+    def provider(layer_idx: int, q_len: int, k_len: int) -> torch.Tensor:
+        assert q_len == num_restore and k_len == context_length + num_restore, (q_len, k_len)
+        return _to_query_heads(restore_allowed(kept[layer_idx], num_restore, mode), num_groups)
+
+    return provider
+
+
+def student_pass_provider(kept: torch.Tensor, num_restore: int, num_groups: int) -> MaskProvider:
+    context_length = kept.shape[-1]
+
+    def provider(layer_idx: int, q_len: int, k_len: int) -> torch.Tensor:
+        assert k_len == context_length + num_restore + q_len, (q_len, k_len)
+        return _to_query_heads(student_allowed(kept[layer_idx], num_restore, q_len), num_groups)
+
+    return provider
