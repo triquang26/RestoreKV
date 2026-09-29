@@ -40,6 +40,23 @@ def kept_mask_from_model(model: PreTrainedModel, context_length: int) -> torch.T
     return kept
 
 
+def move_adapters_to_base_device(model: PreTrainedModel):
+    """``load_adapter`` may leave LoRA weights on CPU when the model was moved with ``.to(device)``."""
+    for module in model.modules():
+        base = getattr(module, "base_layer", None)
+        if base is not None and hasattr(module, "lora_A"):
+            device = base.weight.device
+            module.lora_A.to(device)
+            module.lora_B.to(device)
+
+
+def prepare_press(press, model: PreTrainedModel):
+    """Load a RestoreKV-style press' adapter up front and put it on the model's device."""
+    if isinstance(press, RestoreKVPress):
+        press.post_init_from_model(model)
+        move_adapters_to_base_device(model)
+
+
 @dataclass
 class PartitionedRestoreKVPress(RestoreKVPress):
     """RestoreKV with Partitioned Restore and Global Fusion.
@@ -80,6 +97,7 @@ class PartitionedRestoreKVPress(RestoreKVPress):
         self.restore_embeddings = embeddings.to(model.device, dtype=model.dtype)
         if self.adapter_name not in getattr(model, "peft_config", {}):
             model.load_adapter(adapter, adapter_name=self.adapter_name)
+            move_adapters_to_base_device(model)
         model.disable_adapters()
         self.restore_model_name = adapter
 

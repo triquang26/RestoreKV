@@ -57,6 +57,9 @@ def make_press(spec: dict, compression_ratio: float):
 def run_rows(pipe, press, df: pd.DataFrame) -> tuple[pd.Series, float]:
     import torch
 
+    from prgf.press import prepare_press
+
+    prepare_press(press, pipe.model)
     preds = pd.Series(index=df.index, dtype=object)
     t0 = time.time()
     with torch.inference_mode():
@@ -77,3 +80,24 @@ def score(df: pd.DataFrame) -> dict:
 
     per_task = {k: v["string_match"] for k, v in calculate_metrics(df.copy()).items()}
     return {"average": round(float(np.mean(list(per_task.values()))), 2), "per_task": per_task, "n": len(df)}
+
+
+def compression_latency(pipe, press, contexts: list[str], warmup: int = 2) -> dict:
+    """Wall time of the one-time cache construction (prefill + scoring + restore pass), per context."""
+    import torch
+    from transformers import DynamicCache
+
+    from prgf.press import prepare_press
+
+    model, times = pipe.model, []
+    prepare_press(press, model)
+    for i, context in enumerate(contexts):
+        ids = pipe.preprocess(context, [""], "", 10**9)["context_ids"].to(model.device)
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        with torch.inference_mode(), press(model):
+            model.model(input_ids=ids, past_key_values=DynamicCache())
+        torch.cuda.synchronize()
+        if i >= warmup:
+            times.append(time.perf_counter() - t0)
+    return {"mean_s": float(np.mean(times)), "std_s": float(np.std(times)), "n": len(times)}

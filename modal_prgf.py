@@ -121,6 +121,15 @@ class Evaluator:
         return {"preds": preds.to_dict(), "seconds": seconds}
 
 
+    @modal.method()
+    def latency(self, specs: dict, ratio: float, n_contexts: int) -> dict:
+        from prgf.evaluate import compression_latency, load_ruler, make_press
+
+        runs.reload()
+        contexts = list(load_ruler("dev")["context"].unique()[:n_contexts])
+        return {name: compression_latency(self.pipe, make_press(spec, ratio), contexts) for name, spec in specs.items()}
+
+
 @app.function(image=kv_image, volumes=volumes, timeout=12 * 3600)
 def evaluate_remote(name: str, spec: dict, ratios: list[float], split: str, n_shards: int) -> dict:
     import os
@@ -176,3 +185,10 @@ def report_remote(split: str) -> str:
 @app.local_entrypoint()
 def report(split: str = "dev"):
     print(report_remote.remote(split))
+
+
+@app.local_entrypoint()
+def latency(specs: str, ratio: float = 0.9, n_contexts: int = 22):
+    """specs: JSON {name: spec}; all measured sequentially on the same GPU."""
+    for name, r in Evaluator().latency.remote(json.loads(specs), ratio, n_contexts).items():
+        print(f"{name:<20} {1000 * r['mean_s']:.1f} ± {1000 * r['std_s']:.1f} ms / context (n={r['n']})")
