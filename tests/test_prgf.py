@@ -197,3 +197,18 @@ def test_eviction_profile_runs(model, adapter_dir):
     regions = [r for r in out["regions"] if isinstance(r["region"], int)]
     assert len(regions) == 7 and all(0 <= r["kept"] <= 1 for r in regions)
     assert len(out["values"]) == 1 and 0 < out["values"][0]["depth"] < 1
+
+
+def test_drop_slots_masks_exactly_the_restore_positions(model, adapter_dir):
+    tok = AutoTokenizer.from_pretrained(TOKENIZER)
+    pipe = pipeline("kv-press-text-generation", model=model, tokenizer=tok, device="cpu")
+    context = " ".join(f"word{i}" for i in range(150))
+    counts = {}
+    for drop in (False, True):
+        press = PartitionedRestoreKVPress(compression_ratio=0.75, adapter=adapter_dir, drop_slots_at_decode=drop)
+        cache = DynamicCache()
+        pipe(context, question="Which word?", press=press, cache=cache, max_new_tokens=2)
+        idx = model.model.layers[0].self_attn.masked_key_indices
+        counts[drop] = (len(idx[2]), int((idx[2] >= cache.get_seq_length() - N_RESTORE).sum()))
+    assert counts[True][0] - counts[False][0] == N_RESTORE * model.config.num_key_value_heads
+    assert counts[False][1] == 0 and counts[True][1] == N_RESTORE * model.config.num_key_value_heads

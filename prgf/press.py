@@ -84,6 +84,7 @@ class PartitionedRestoreKVPress(RestoreKVPress):
     mask_mode: MaskMode = "prgf"
     exchange_from: float | None = None
     selection_only: bool = False
+    drop_slots_at_decode: bool = False  # diagnostics only: evict the restore slots again after building them
     kept_mask: torch.Tensor | None = field(init=False, default=None, repr=False)
     scores: torch.Tensor | None = field(init=False, default=None, repr=False)  # KVzip scores of the last context
 
@@ -122,6 +123,21 @@ class PartitionedRestoreKVPress(RestoreKVPress):
             return
         # 2) Restore pass over the still-complete cache, masked per (layer, KV head).
         self.append_restore_tokens(model)
+        if self.drop_slots_at_decode:
+            self._mask_restore_slots(model)
+
+    def _mask_restore_slots(self, model: PreTrainedModel):
+        n, T = self.num_restore_tokens, self.context_length
+        for layer in model.model.layers:
+            module = layer.self_attn
+            batch, heads, positions = module.masked_key_indices
+            h = torch.arange(model.config.num_key_value_heads).repeat_interleave(n)
+            pos = torch.arange(T, T + n).repeat(model.config.num_key_value_heads)
+            module.masked_key_indices = (
+                torch.cat([batch, torch.zeros_like(h).to(batch.device)]),
+                torch.cat([heads, h.to(heads.device)]),
+                torch.cat([positions, pos.to(positions.device)]),
+            )
 
     def append_restore_tokens(self, model: PreTrainedModel):
         if self.mask_mode == "causal":

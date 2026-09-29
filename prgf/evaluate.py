@@ -29,6 +29,9 @@ def load_ruler(split: str) -> pd.DataFrame:
     df["max_new_tokens"] = df["max_new_tokens"].astype(int)
     if split == "all":
         return df
+    split, _, tasks = split.partition("@")  # e.g. "test:50@niah_single_2,niah_multivalue"
+    if tasks:
+        df = df[df["task"].isin(tasks.split(","))]
     split, _, per_task = split.partition(":")
     assert split in ("dev", "test"), split
     k = int(per_task) if per_task else None
@@ -49,14 +52,15 @@ def make_press(spec: dict, compression_ratio: float):
     method, plus = spec["method"], spec.get("plus", False)
     if method == "no_press":
         return None
+    extra = {k: spec[k] for k in ("chunk_size",) if k in spec}  # diagnostics
     if method == "kvzip":
-        return KVzipPress(compression_ratio=compression_ratio, kvzip_plus_normalization=plus)
+        return KVzipPress(compression_ratio=compression_ratio, kvzip_plus_normalization=plus, **extra)
     if method == "restorekv" and spec.get("adapter") is None:  # the official kvpress implementation, untouched
         return RestoreKVPress(compression_ratio=compression_ratio, kvzip_plus_normalization=plus)
     mode = spec.get("mask_mode", "prgf" if method == "prgf" else "causal")
     return PartitionedRestoreKVPress(
         compression_ratio=compression_ratio, kvzip_plus_normalization=plus, adapter=spec.get("adapter"), mask_mode=mode,
-        exchange_from=spec.get("exchange_from"),
+        exchange_from=spec.get("exchange_from"), drop_slots_at_decode=spec.get("drop_slots_at_decode", False), **extra,
     )
 
 
