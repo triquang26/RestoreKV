@@ -49,8 +49,22 @@ v1 on dev:20 at cr=0.95 (74.4-75.9 across checkpoints vs 75.4 for v1); v1 is the
 | 0.9375 | 6.25% (16x, KVPress benchmark setting) | 84.48 |
 
 The 5% test score (75.63) matches dev (76.50): no sign of overfitting to the development split.
-Baselines were not run on the test split (budget), so test numbers are not a paired comparison.
-Note: the paper's 86.4 at 16x is RestoreKV on **KVzip+** scoring; PRGF here uses plain KVzip.
+
+### Against the published KVPress leaderboard (cr = 0.9375, 16x)
+
+The leaderboard ships per-sample predictions for all 6500 RULER-4K rows, so PRGF is compared on the
+exact same 650 test rows (paired bootstrap, 95% CI):
+
+| Method | Leaderboard (6500) | Same 650 test rows | PRGF v1 - method |
+|---|---|---|---|
+| RestoreKV (KVzip scoring) | 81.93 | 83.20 | +1.28 [-0.71, +3.26] |
+| RestoreKV+ (KVzip+ scoring, #1) | 86.38 | 86.33 | -1.85 [-3.95, +0.25] |
+| **PRGF v1 (KVzip scoring)** | - | **84.48** | |
+
+The like-for-like baseline is RestoreKV (same KVzip scorer). Leaderboard runs used FlashAttention-2 and
+the older `qwen3-8b_restorekv.pt` checkpoint; ours use SDPA and the PEFT checkpoint.
+The PRGF gain grows as the budget shrinks: +0.9 (10%, dev), +1.3 (6.25%, test vs leaderboard),
++4.2 (5%, dev, significant). PRGF on KVzip+ (init from RestoreKV+) is the natural next step.
 
 ## Cost / throughput (A100, per 4K context)
 
