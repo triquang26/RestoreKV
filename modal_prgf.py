@@ -4,6 +4,9 @@
     modal run modal_prgf.py::train --name prgf --mask-mode prgf  # -> /runs/ckpt/<name>/final
     modal run modal_prgf.py::evaluate --name kvzip --spec '{"method": "kvzip"}' --ratios 0.9,0.95 --split dev
     modal run modal_prgf.py::report --split dev                 # table of everything under /runs/results
+
+GPU budget: every GPU function is capped (max_containers) so that one data/eval job plus one training
+job never exceed 4 concurrent A100s. Run at most one evaluate job at a time.
 """
 
 import json
@@ -33,13 +36,14 @@ kv_image = (
 vllm_image = (
     modal.Image.debian_slim(python_version="3.11")
     .pip_install("vllm", "datasets")
-    .env({"HF_HOME": HF, "TOKENIZERS_PARALLELISM": "false"})
+    # FlashInfer's sampler JIT-compiles with nvcc, which the slim image does not ship.
+    .env({"HF_HOME": HF, "TOKENIZERS_PARALLELISM": "false", "VLLM_USE_FLASHINFER_SAMPLER": "0"})
     .add_local_python_source("prgf")
 )
 
 
 # ----------------------------------------------------------------------------- data
-@app.function(image=vllm_image, gpu="A100-80GB", volumes=volumes, timeout=4 * 3600)
+@app.function(image=vllm_image, gpu="A100-80GB", volumes=volumes, timeout=4 * 3600, max_containers=2)
 def generate_qa_shard(items: list[dict]) -> list[dict]:
     from transformers import AutoTokenizer
     from vllm import LLM
@@ -58,10 +62,17 @@ def build_data_remote(n_longalpaca: int, n_pg19: int, n_flan: int, shards: int, 
 
     from prgf.data import collect_contexts
 
-    data = collect_contexts(AutoTokenizer.from_pretrained(MODEL), n_longalpaca, n_pg19, n_flan, seed=seed)
-    print(f"collected {len(data)} contexts")
+    contexts_path = f"{RUNS}/data/contexts_{n_longalpaca}_{n_pg19}_{n_flan}_{seed}.jsonl"
+    if os.path.exists(contexts_path):
+        data = [json.loads(line) for line in open(contexts_path)]
+    else:
+        data = collect_contexts(AutoTokenizer.from_pretrained(MODEL), n_longalpaca, n_pg19, n_flan, seed=seed)
+        os.makedirs(f"{RUNS}/data", exist_ok=True)
+        with open(contexts_path, "w") as f:
+            f.writelines(json.dumps(d) + "\n" for d in data)
+        runs.commit()
+    print(f"{len(data)} contexts")
     out = [d for shard in generate_qa_shard.map([data[i::shards] for i in range(shards)]) for d in shard]
-    os.makedirs(f"{RUNS}/data", exist_ok=True)
     with open(f"{RUNS}/data/train.jsonl", "w") as f:
         f.writelines(json.dumps(d) + "\n" for d in sorted(out, key=lambda d: d["id"]))
     runs.commit()
@@ -70,12 +81,12 @@ def build_data_remote(n_longalpaca: int, n_pg19: int, n_flan: int, shards: int, 
 
 
 @app.local_entrypoint()
-def build_data(n_longalpaca: int = 1200, n_pg19: int = 1000, n_flan: int = 500, shards: int = 4, seed: int = 0):
+def build_data(n_longalpaca: int = 1200, n_pg19: int = 1000, n_flan: int = 500, shards: int = 2, seed: int = 0):
     build_data_remote.remote(n_longalpaca, n_pg19, n_flan, shards, seed)
 
 
 # ----------------------------------------------------------------------------- training
-@app.function(image=kv_image, gpu="A100-80GB", volumes=volumes, timeout=24 * 3600)
+@app.function(image=kv_image, gpu="A100-80GB", volumes=volumes, timeout=24 * 3600, max_containers=2)
 def train_remote(cfg: dict):
     from prgf.train import TrainConfig, Trainer
 
@@ -93,7 +104,7 @@ def train(name: str, mask_mode: str = "prgf", steps: int = 2000, lr: float = 1e-
 
 
 # ----------------------------------------------------------------------------- evaluation
-@app.cls(image=kv_image, gpu="A100", volumes=volumes, timeout=6 * 3600, max_containers=10)
+@app.cls(image=kv_image, gpu="A100", volumes=volumes, timeout=6 * 3600, max_containers=2)
 class Evaluator:
     @modal.enter()
     def load(self):
@@ -162,7 +173,7 @@ def evaluate_remote(name: str, spec: dict, ratios: list[float], split: str, n_sh
 
 
 @app.local_entrypoint()
-def evaluate(name: str, spec: str, ratios: str = "0.8,0.9,0.95", split: str = "dev", n_shards: int = 4):
+def evaluate(name: str, spec: str, ratios: str = "0.8,0.9,0.95", split: str = "dev", n_shards: int = 2):
     print(evaluate_remote.remote(name, json.loads(spec), [float(r) for r in ratios.split(",")], split, n_shards))
 
 
@@ -192,3 +203,32 @@ def latency(specs: str, ratio: float = 0.9, n_contexts: int = 22):
     """specs: JSON {name: spec}; all measured sequentially on the same GPU."""
     for name, r in Evaluator().latency.remote(json.loads(specs), ratio, n_contexts).items():
         print(f"{name:<20} {1000 * r['mean_s']:.1f} ± {1000 * r['std_s']:.1f} ms / context (n={r['n']})")
+
+
+# ----------------------------------------------------------------------------- smoke test
+@app.function(image=kv_image, gpu="A100", volumes=volumes, timeout=1800)
+def smoke_remote(adapter: str | None = None):
+    """One RULER-like query through every restore press on a real GPU (catches device/adapter issues)."""
+    import torch
+    from transformers import pipeline
+
+    from prgf.evaluate import make_press
+    from prgf.press import prepare_press
+
+    pipe = pipeline(
+        "kv-press-text-generation", model=MODEL, device="cuda:0", dtype=torch.bfloat16,
+        model_kwargs={"attn_implementation": "sdpa"},
+    )
+    context = "Filler text about nothing in particular. " * 150 + "The secret code is 4242. " + "More filler. " * 150
+    for spec in [{"method": "restorekv"}, {"method": "restorekv", "adapter": adapter or f"higokri/RestoreKV-{MODEL.split('/')[-1]}"},
+                 {"method": "prgf", "adapter": adapter}]:
+        press = make_press(spec, 0.9)
+        prepare_press(press, pipe.model)
+        devices = {str(p.device) for n, p in pipe.model.named_parameters() if "lora_" in n}
+        answer = pipe(context, question="What is the secret code?", press=press, max_new_tokens=8)["answer"]
+        print(f"{spec} lora devices={devices} answer={answer!r}")
+
+
+@app.local_entrypoint()
+def smoke(adapter: str = ""):
+    smoke_remote.remote(adapter or None)
