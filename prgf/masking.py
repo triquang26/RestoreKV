@@ -79,24 +79,22 @@ def region_ids(context_length: int, num_regions: int, device=None) -> torch.Tens
 def restore_allowed(kept: torch.Tensor, num_restore: int, mode: MaskMode = "prgf") -> torch.Tensor:
     """Allowed-attention pattern of the restore tokens.
 
-    kept: (num_kv_heads, T) bool, positions surviving eviction for one layer.
-    Returns (num_kv_heads, n, T + n) bool.
+    kept: (..., num_kv_heads, T) bool, positions surviving eviction (any leading dims, e.g. layers).
+    Returns (..., num_kv_heads, n, T + n) bool.
     """
-    num_kv_heads, context_length = kept.shape
+    *lead, context_length = kept.shape
     n, device = num_restore, kept.device
     slots = torch.ones(n, n, dtype=torch.bool, device=device).tril()
-    if mode == "causal":
-        ctx = torch.ones(num_kv_heads, n, context_length, dtype=torch.bool, device=device)
-    elif mode == "prgf":
+    ctx = torch.ones(*lead, n, context_length, dtype=torch.bool, device=device)
+    if mode == "prgf":
         assert n >= 2, "PRGF needs at least one local slot and one global slot"
         regions = region_ids(context_length, n - 1, device)
         own_region = regions[None, :] == torch.arange(n - 1, device=device)[:, None]  # (n-1, T)
-        ctx = torch.ones(num_kv_heads, n, context_length, dtype=torch.bool, device=device)
-        ctx[:, : n - 1] = kept[:, None, :] | own_region[None]
+        ctx[..., : n - 1, :] = kept[..., None, :] | own_region
         slots[: n - 1] = torch.eye(n, dtype=torch.bool, device=device)[: n - 1]  # locals: only themselves
-    else:
+    elif mode != "causal":
         raise ValueError(f"Unknown mask mode {mode!r}")
-    return torch.cat([ctx, slots[None].expand(num_kv_heads, n, n)], dim=-1)
+    return torch.cat([ctx, slots.expand(*lead, n, n)], dim=-1)
 
 
 def student_allowed(kept: torch.Tensor, num_restore: int, q_len: int) -> torch.Tensor:
@@ -115,12 +113,13 @@ def _to_query_heads(allowed: torch.Tensor, num_groups: int) -> torch.Tensor:
 
 
 def restore_pass_provider(kept: torch.Tensor, num_restore: int, num_groups: int, mode: MaskMode) -> MaskProvider:
-    """kept: (num_layers, num_kv_heads, T) bool."""
+    """kept: (num_layers, num_kv_heads, T) bool. Masks of all layers are built at once (a few kernels)."""
     context_length = kept.shape[-1]
+    allowed = restore_allowed(kept, num_restore, mode)  # (L, H_kv, n, T + n)
 
     def provider(layer_idx: int, q_len: int, k_len: int) -> torch.Tensor:
         assert q_len == num_restore and k_len == context_length + num_restore, (q_len, k_len)
-        return _to_query_heads(restore_allowed(kept[layer_idx], num_restore, mode), num_groups)
+        return _to_query_heads(allowed[layer_idx], num_groups)
 
     return provider
 

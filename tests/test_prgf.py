@@ -143,3 +143,30 @@ def test_cached_tokenizer_is_reused():
 
     speedups.enable()
     assert kz.AutoTokenizer.from_pretrained(TOKENIZER) is kz.AutoTokenizer.from_pretrained(TOKENIZER)
+
+
+def test_restore_mask_batched_over_layers_matches_per_layer():
+    kept = torch.rand(3, 2, 29) < 0.4
+    for mode in ("prgf", "causal"):
+        batched = restore_allowed(kept, N_RESTORE, mode)
+        assert torch.equal(batched, torch.stack([restore_allowed(k, N_RESTORE, mode) for k in kept]))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+def test_fast_hyperplane_search_is_bit_identical(dtype):
+    from prgf.speedups import _original_search_hyperplane as reference
+    from prgf.speedups import search_hyperplane
+
+    iterations = []
+    for seed in range(30):
+        torch.manual_seed(seed)
+        x = torch.randn(4, 12, 16).to(dtype)
+        y = x.float().mean(1).to(dtype)
+        for n in range(1000):  # count the reference iterations to make sure hard cases are covered
+            mask = torch.bmm(x, y.unsqueeze(-1)) <= 0
+            if not mask.any():
+                break
+            y += (x * mask).sum(1) / mask.sum(1).clamp(min=1)
+        iterations.append(n)
+        assert torch.equal(search_hyperplane(x), reference(x))
+    assert max(iterations) >= 5 and len({n % 4 for n in iterations}) > 1  # stops between host checks too
