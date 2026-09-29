@@ -19,9 +19,10 @@ from dataclasses import asdict, dataclass
 
 import torch
 import torch.nn.functional as F
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 
+from prgf import speedups
 from prgf.data import kvpress_inputs
 from prgf.masking import MaskMode, attention_bias, restore_pass_provider, student_pass_provider
 from prgf.press import EMBEDDINGS_FILE, PartitionedRestoreKVPress
@@ -44,6 +45,7 @@ class TrainConfig:
     max_qa_per_step: int = 5
     max_answer_tokens: int = 512
     seed: int = 0
+    score_cache_dir: str | None = None  # per-context KVzip scores, filled on first use and reused by later runs
     log_every: int = 25
     save_every: int = 500
 
@@ -53,6 +55,29 @@ def _cache_from(layers_kv: list[tuple[torch.Tensor, torch.Tensor]]) -> DynamicCa
     for i, (k, v) in enumerate(layers_kv):
         cache.update(k, v, i)
     return cache
+
+
+class PhaseTimer:
+    """Accumulates wall time per training phase (CUDA-synchronized at phase boundaries)."""
+
+    def __init__(self):
+        self.totals: dict[str, float] = {}
+        self._last = None
+
+    def start(self):
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        self._last = time.perf_counter()
+
+    def lap(self, name: str):
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        now = time.perf_counter()
+        self.totals[name] = self.totals.get(name, 0.0) + now - self._last
+        self._last = now
+
+    def summary(self, steps: int) -> str:
+        out = " ".join(f"{k}={1000 * v / steps:.0f}ms" for k, v in self.totals.items())
+        self.totals = {}
+        return out
 
 
 def symmetric_kl(teacher_logits: torch.Tensor, student_logits: torch.Tensor) -> torch.Tensor:
@@ -65,6 +90,7 @@ def symmetric_kl(teacher_logits: torch.Tensor, student_logits: torch.Tensor) -> 
 class Trainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
+        speedups.enable()
         self.rng = random.Random(cfg.seed)
         torch.manual_seed(cfg.seed)
         self.tok = AutoTokenizer.from_pretrained(cfg.model)
@@ -93,6 +119,7 @@ class Trainer:
         n_params = sum(p.numel() for p in params)
         print(f"trainable params: {n_params / 1e6:.2f}M | adapter {self.adapter} | mask {cfg.mask_mode}")
 
+        self.timer = PhaseTimer()
         with open(cfg.data_path) as f:
             self.data = [json.loads(line) for line in f]
 
@@ -112,6 +139,25 @@ class Trainer:
         # time silently drops its gradient, so keep them trainable either way.
         for p in self.lora:
             p.requires_grad_(True)
+
+    def _score_path(self, sample) -> str | None:
+        if self.cfg.score_cache_dir is None:
+            return None
+        return os.path.join(self.cfg.score_cache_dir, f"{sample['id']}.safetensors")
+
+    def _load_scores(self, sample):
+        path = self._score_path(sample)
+        if path is None or not os.path.exists(path):
+            return None
+        return load_file(path, device=str(self.model.device))["scores"]
+
+    def _save_scores(self, sample, scores):
+        path = self._score_path(sample)
+        if path is None:
+            return
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        save_file({"scores": scores.contiguous().cpu()}, path + ".tmp")
+        os.replace(path + ".tmp", path)  # atomic: concurrent runs never read a partial file
 
     def _batch(self, sample):
         ctx_ids, q_ids = kvpress_inputs(self.tok, sample["context"], sample["questions"])
@@ -135,22 +181,32 @@ class Trainer:
 
     def step(self, sample):
         model, n = self.model, self.num_restore
+        self.timer.start()
         ctx_ids, qa_ids, where = self._batch(sample)
         batch = qa_ids.shape[0]
 
         # 1) prefill + KVzip selection (reserves n*L*H pairs of the budget for the restore slots)
         self.press.compression_ratio = 1 - self.rng.uniform(self.cfg.budget_min, self.cfg.budget_max)
-        cache = DynamicCache()
-        with torch.no_grad(), self.press(model):
-            model.model(input_ids=ctx_ids, past_key_values=cache)
-        kept, T = self.press.kept_mask, ctx_ids.shape[1]
+        cache, cached = DynamicCache(), self._load_scores(sample)
+        with torch.no_grad():
+            if cached is None:
+                with self.press(model):
+                    model.model(input_ids=ctx_ids, past_key_values=cache)
+                self._save_scores(sample, self.press.scores)
+                kept = self.press.kept_mask
+            else:
+                model.model(input_ids=ctx_ids, past_key_values=cache)
+                kept = self.press.select_from_scores(model, cached)
+        T = ctx_ids.shape[1]
         ctx_kv = [(layer.keys, layer.values) for layer in cache.layers]
+        self.timer.lap("select")
 
         # 2) teacher over the full cache
         with torch.no_grad():
             full = _cache_from([(k.expand(batch, -1, -1, -1), v.expand(batch, -1, -1, -1)) for k, v in ctx_kv])
             teacher = self._logits(qa_ids, full, T, where)
             del full
+        self.timer.lap("teacher")
 
         # 3) restore pass (LoRA on) with the method's mask
         pos = torch.arange(T, T + n, device=model.device)
@@ -165,6 +221,7 @@ class Trainer:
         finally:
             self._adapters(False)
         slots = [(layer.keys[:, :, T:], layer.values[:, :, T:]) for layer in restore_cache.layers]
+        self.timer.lap("restore")
 
         # 4) student over kept cache + restore slots (evicted positions are hard-masked)
         student_cache = _cache_from([
@@ -175,11 +232,13 @@ class Trainer:
             student = self._logits(qa_ids, student_cache, T + n, where)
 
         loss = symmetric_kl(teacher, student)
+        self.timer.lap("student_fwd")
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_([self.embeddings, *self.lora], self.cfg.max_grad_norm)
         self.optim.step()
         self.sched.step()
         self.optim.zero_grad(set_to_none=True)
+        self.timer.lap("backward_optim")
         return loss.item(), grad_norm.item(), 1 - self.press.compression_ratio
 
     def save(self, path):
@@ -202,7 +261,8 @@ class Trainer:
                 rate = (step + 1) / (time.time() - t0)
                 print(
                     f"step {step + 1}/{self.cfg.steps} loss {sum(window) / len(window):.4f} gnorm {gnorm:.3f} "
-                    f"budget {budget:.3f} lr {self.sched.get_last_lr()[0]:.2e} {rate:.2f} it/s",
+                    f"budget {budget:.3f} lr {self.sched.get_last_lr()[0]:.2e} {rate:.2f} it/s | "
+                    f"{self.timer.summary(self.cfg.log_every)}",
                     flush=True,
                 )
                 window = []

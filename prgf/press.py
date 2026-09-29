@@ -82,6 +82,7 @@ class PartitionedRestoreKVPress(RestoreKVPress):
     mask_mode: MaskMode = "prgf"
     selection_only: bool = False
     kept_mask: torch.Tensor | None = field(init=False, default=None, repr=False)
+    scores: torch.Tensor | None = field(init=False, default=None, repr=False)  # KVzip scores of the last context
 
     @property
     def adapter_name(self) -> str:
@@ -103,6 +104,7 @@ class PartitionedRestoreKVPress(RestoreKVPress):
 
     def compress_post(self, model: PreTrainedModel):
         # 1) Eviction first: KVzip keeps B - n*L*H pairs (budget-matched, identical to RestoreKV).
+        self.scores = self.score_val.clone() if self.selection_only else None  # before sinks are overwritten
         requested_ratio = self.compression_ratio
         if self.context_length > 0:
             self.compression_ratio = min(1.0, requested_ratio + self.num_restore_tokens / self.context_length)
@@ -126,3 +128,18 @@ class PartitionedRestoreKVPress(RestoreKVPress):
         provider = restore_pass_provider(self.kept_mask, self.num_restore_tokens, num_groups, self.mask_mode)
         with attention_bias(provider):
             super().append_restore_tokens(model)
+
+    def select_from_scores(self, model: PreTrainedModel, scores: torch.Tensor) -> torch.Tensor:
+        """Eviction selection from precomputed KVzip scores (L, 1, H, T) — same code path as compress_post.
+
+        KVzip scores depend only on the context, so the trainer caches them instead of re-running the
+        chunked reconstruction passes for every run and budget.
+        """
+        assert self.selection_only
+        self.score_val = scores.to(model.device, model.dtype).clone()
+        self.context_length = scores.shape[-1]
+        try:
+            self.compress_post(model)
+        finally:
+            self._reset_internal_parameters()
+        return self.kept_mask

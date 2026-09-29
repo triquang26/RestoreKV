@@ -37,9 +37,9 @@ def tiny(tmp_path_factory):
     save_file({"restore_embeddings": torch.randn(8, 64)}, str(root / "adapter" / EMBEDDINGS_FILE))
 
     rows = [
-        {"context": " ".join(f"fact{i}" for i in range(200)), "questions": ["What?", "Why?"],
+        {"id": 0, "context": " ".join(f"fact{i}" for i in range(200)), "questions": ["What?", "Why?"],
          "answer_ids": [[1, 2, 3, 4], [5, 6, 7]]},
-        {"context": "short context " * 30, "questions": [""], "answer_ids": [[9, 10, 11]]},
+        {"id": 1, "context": "short context " * 30, "questions": [""], "answer_ids": [[9, 10, 11]]},
     ]
     with open(root / "data.jsonl", "w") as f:
         f.writelines(json.dumps(r) + "\n" for r in rows)
@@ -89,3 +89,25 @@ def test_kvpress_inputs_matches_pipeline():
     ctx, qs = kvpress_inputs(tok, context, questions)
     assert ctx == ref["context_ids"][0].tolist()
     assert qs == [q[0].tolist() for q in ref["questions_ids"]]
+
+
+def test_cached_scores_give_identical_selection(tiny):
+    """Second pass over the same sample loads KVzip scores from disk and must select the same KV pairs."""
+    root, _ = tiny
+    cfg = TrainConfig(
+        data_path=str(root / "data.jsonl"), output_dir=str(root / "out_cache"), model=str(root / "model"),
+        init_adapter=str(root / "adapter"), score_cache_dir=str(root / "scores"), steps=1,
+    )
+    trainer = Trainer(cfg)
+    sample = trainer.data[0]
+    ctx_ids, _, _ = trainer._batch(sample)
+    trainer.press.compression_ratio = 0.9
+    from transformers import DynamicCache
+
+    with torch.no_grad(), trainer.press(trainer.model):
+        trainer.model.model(input_ids=ctx_ids, past_key_values=DynamicCache())
+    fresh = trainer.press.kept_mask.clone()
+    trainer._save_scores(sample, trainer.press.scores)
+    cached = trainer.press.select_from_scores(trainer.model, trainer._load_scores(sample))
+    assert torch.equal(fresh, cached)
+    assert not cached.all()  # something was actually evicted

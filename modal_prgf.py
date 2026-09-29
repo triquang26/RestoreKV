@@ -88,19 +88,20 @@ def build_data(n_longalpaca: int = 1200, n_pg19: int = 1000, n_flan: int = 500, 
 # ----------------------------------------------------------------------------- training
 @app.function(image=kv_image, gpu="A100-80GB", volumes=volumes, timeout=24 * 3600, max_containers=2)
 def train_remote(cfg: dict):
-    from prgf import speedups
     from prgf.train import TrainConfig, Trainer
 
-    speedups.enable()
     Trainer(TrainConfig(**cfg)).train(on_save=runs.commit)
     runs.commit()
 
 
 @app.local_entrypoint()
-def train(name: str, mask_mode: str = "prgf", steps: int = 2000, lr: float = 1e-4, seed: int = 0):
+def train(
+    name: str, mask_mode: str = "prgf", steps: int = 2000, lr: float = 1e-4, max_answer_tokens: int = 256, seed: int = 0
+):
     cfg = dict(
         data_path=f"{RUNS}/data/train.jsonl", output_dir=f"{RUNS}/ckpt/{name}", model=MODEL,
-        mask_mode=mask_mode, steps=steps, lr=lr, seed=seed,
+        mask_mode=mask_mode, steps=steps, lr=lr, max_answer_tokens=max_answer_tokens, seed=seed,
+        score_cache_dir=f"{RUNS}/data/kvzip_scores",
     )
     train_remote.remote(cfg)
 
