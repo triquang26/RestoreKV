@@ -29,9 +29,7 @@ def load_ruler(split: str) -> pd.DataFrame:
     df["max_new_tokens"] = df["max_new_tokens"].astype(int)
     if split == "all":
         return df
-    split, _, tasks = split.partition("@")  # e.g. "test:50@niah_single_2,niah_multivalue"
-    if tasks:
-        df = df[df["task"].isin(tasks.split(","))]
+    split, _, tasks = split.partition("@")  # e.g. "test:50@niah_single_2,niah_multivalue" (filter AFTER splitting)
     split, _, per_task = split.partition(":")
     assert split in ("dev", "test"), split
     k = int(per_task) if per_task else None
@@ -40,7 +38,8 @@ def load_ruler(split: str) -> pd.DataFrame:
     for _, g in df.groupby("task", sort=True):
         order = rng.permutation(g.index.to_numpy())
         rows += list((order[:DEV_PER_TASK] if split == "dev" else order[DEV_PER_TASK:])[:k])
-    return df.loc[sorted(rows)]
+    out = df.loc[sorted(rows)]
+    return out[out["task"].isin(tasks.split(","))] if tasks else out
 
 
 def make_press(spec: dict, compression_ratio: float):
