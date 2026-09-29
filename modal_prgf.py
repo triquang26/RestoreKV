@@ -242,3 +242,30 @@ def smoke_remote(adapter: str | None = None):
 @app.local_entrypoint()
 def smoke(adapter: str = ""):
     smoke_remote.remote(adapter or None)
+
+
+# ----------------------------------------------------------------------------- training profiler
+@app.function(image=kv_image, gpu="A100-80GB", volumes=volumes, timeout=3600)
+def profile_train_remote(mask_mode: str, steps: int):
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    from prgf.train import TrainConfig, Trainer
+
+    trainer = Trainer(TrainConfig(
+        data_path=f"{RUNS}/data/train.jsonl", output_dir="/tmp/profile", model=MODEL, mask_mode=mask_mode,
+        max_answer_tokens=256, score_cache_dir=f"{RUNS}/data/kvzip_scores",
+    ))
+    for i in range(3):  # warm-up
+        trainer.step(trainer.data[i])
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for i in range(3, 3 + steps):
+            trainer.step(trainer.data[i])
+    print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=25, max_name_column_width=60))
+    print(prof.key_averages().table(sort_by="cpu_time_total", row_limit=15, max_name_column_width=60))
+    print(trainer.timer.summary(steps + 3))
+
+
+@app.local_entrypoint()
+def profile_train(mask_mode: str = "prgf", steps: int = 5):
+    profile_train_remote.remote(mask_mode, steps)
