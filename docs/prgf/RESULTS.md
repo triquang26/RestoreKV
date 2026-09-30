@@ -188,3 +188,16 @@ this half), paired against the leaderboard predictions on the same rows:
 v4+ - RestoreKV+ = +4.89 [+2.26, +7.79]; - RestoreKV = +6.61 [+3.55, +9.79]; - PRGF v4 = +4.57 [+2.36, +6.85];
 - full cache = -6.25 [-8.37, -4.29]. These rows are slightly easier than the full test:50 (PRGF v4: 85.82 here vs
 85.12 on test:50), so the test:50 number is expected around 89.5-90; it still has to be measured.
+
+Full held-out **test:50** (650 samples; test:25 above + rows 25-50 of each task, 89.34, same checkpoint and settings):
+
+| | average | cwe | fwe | multikey_1 | multivalue | single_2 | qa_1 | qa_2 |
+|---|---|---|---|---|---|---|---|---|
+| full cache | 96.07 | 98.2 | 92.7 | 100 | 100 | 100 | 90 | 68 |
+| RestoreKV | 83.20 | 42.6 | 80.0 | 94 | 77.0 | 72 | 76 | 52 |
+| RestoreKV+ | 86.33 | 79.8 | 80.0 | 86 | 83.0 | 84 | 74 | 48 |
+| PRGF v4 (KVzip) | 85.12 | 47.2 | 83.3 | 96 | 77.0 | 74 | 78 | 58 |
+| **PRGF v4+ (KVzip+)** | **89.86** | 76.4 | 85.3 | 100 | 87.5 | 94 | 78 | 58 |
+
+v4+ - RestoreKV+ = **+3.53 [+1.79, +5.27]**; - RestoreKV = +6.66 [+4.45, +8.84]; - PRGF v4 = +4.75 [+3.06, +6.42];
+- full cache = -6.20 [-7.73, -4.75].
