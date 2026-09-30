@@ -242,3 +242,10 @@ B (partition mask, no reconstruction), same init and schedule:
 D - B (reconstruction, given the partition): -0.09 [-1.61, +1.51] at 16x, +1.06 [-0.55, +2.77] at 20x.
 B - C: -0.27 [-1.81, +1.25] at 16x, **+5.45 [+3.52, +7.53]** at 20x. At 20x the partition mask carries the effect,
 region reconstruction adds at most about one point (not significant). A (causal, no reconstruction) pending.
+
+### Backend / checkpoint control (test:50, cr = 0.9375)
+
+The official RestoreKV+ press run in our pipeline (SDPA, PEFT checkpoint `higokri/RestoreKV-Qwen3-8B_plus`)
+against the leaderboard predictions (FlashAttention-2, original checkpoint) on the same 650 rows:
+86.33 vs 86.33, **difference +0.00 [-1.12, +1.20]**. Backend and checkpoint format do not move the score, so the
+comparison with the leaderboard is like-for-like: PRGF v4+ - RestoreKV+ (both in our pipeline) = +3.53 [+1.91, +5.24].
