@@ -361,7 +361,7 @@ def train_config(name: str, **kw) -> dict:
 def run_plan_remote(jobs: list[dict]) -> list:
     """Run train / eval jobs one after the other (server-side: survives client restarts, never two GPUs).
 
-    {"train": name, **TrainConfig fields}  |  {"eval": name, "spec": {...}, "ratios": [...], "split": str}
+    {"train": name, **TrainConfig fields}  |  {"eval": name, "spec": {...}, "ratios": [...], "split": str, "n_shards": int}
     A finished training run (``final`` exists) is skipped, so a plan can be re-submitted after a failure.
     """
     import os
@@ -376,7 +376,8 @@ def run_plan_remote(jobs: list[dict]) -> list:
                 train_remote.remote(cfg)
             out.append({"trained": cfg["output_dir"]})
         else:
-            res = evaluate_remote.remote(job["eval"], job["spec"], job.get("ratios", [0.9375]), job["split"], 1)
+            # shards run one after the other (Evaluator has one container); a preemption only redoes one shard
+            res = evaluate_remote.remote(job["eval"], job["spec"], job.get("ratios", [0.9375]), job["split"], job.get("n_shards", 4))
             out.append({job["eval"]: res})
         print(out[-1], flush=True)
     return out
