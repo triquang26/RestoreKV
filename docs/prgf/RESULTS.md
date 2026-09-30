@@ -217,5 +217,16 @@ cr = 0.9375, paired bootstrap:
 
 **D - C = -0.37 [-1.59, +0.89]**: once 16 slots and region reconstruction are controlled, the partition mask adds
 nothing at 16x. C - RestoreKV+ = +1.58; D - RestoreKV+ = +1.22 [-0.66, +3.20]. The gain of the v4 line over
-RestoreKV+ therefore cannot be attributed to the partition mask at this budget; A / B (no reconstruction) and the
-5% budget (where PRGF v1 had its largest gain) are running.
+RestoreKV+ therefore cannot be attributed to the partition mask at this budget.
+
+Same two checkpoints at **cr = 0.95 (5% budget, 20x)**, full dev:
+
+| | cwe | fwe | multikey_1 | multikey_3 | multiquery | multivalue | single_2 | qa_1 | qa_2 | average |
+|---|---|---|---|---|---|---|---|---|---|---|
+| C (causal + recon) | 46.8 | 69.2 | 77.5 | 72.5 | 87.5 | 72.5 | 82.5 | 62.5 | 40.0 | 75.65 |
+| D (partition + recon) | 52.2 | 75.8 | 87.5 | 92.5 | 93.8 | 76.2 | 90.0 | 72.5 | 47.5 | 82.15 |
+
+**D - C = +6.51 [+4.40, +8.75]**, D ahead or equal on all 13 tasks. The effect of the partition mask is
+budget-dependent: none at 16x, large at 20x, consistent with PRGF v1 (KVzip, 8 slots), whose gain over RestoreKV
+was +0.9 at 10%, +1.3 at 6.25% and +4.2 at 5%. With little kept context, unrestricted slots degrade (C loses
+10.4 points from 16x to 20x) while partitioned slots keep most of their accuracy (D loses 3.5).
