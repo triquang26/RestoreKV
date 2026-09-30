@@ -362,14 +362,23 @@ def run_plan_remote(jobs: list[dict]) -> list:
     """Run train / eval jobs one after the other (server-side: survives client restarts, never two GPUs).
 
     {"train": name, **TrainConfig fields}  |  {"eval": name, "spec": {...}, "ratios": [...], "split": str, "n_shards": int}
+    |  {"wait": path}  (block until another plan has written ``path``)
     A finished training run (``final`` exists) is skipped, so a plan can be re-submitted after a failure.
     """
     import os
+    import time
 
     out = []
     for job in jobs:
         job = dict(job)
-        if "train" in job:
+        if "wait" in job:  # start only once another plan produced this file (keeps one GPU busy at a time)
+            while True:
+                runs.reload()
+                if os.path.exists(job["wait"]):
+                    break
+                time.sleep(120)
+            out.append({"waited": job["wait"]})
+        elif "train" in job:
             cfg = train_config(job.pop("train"), **job)
             runs.reload()
             if not os.path.exists(os.path.join(cfg["output_dir"], "final", "adapter_model.safetensors")):
