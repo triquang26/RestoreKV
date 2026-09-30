@@ -201,3 +201,21 @@ Full held-out **test:50** (650 samples; test:25 above + rows 25-50 of each task,
 
 v4+ - RestoreKV+ = **+3.53 [+1.79, +5.27]**; - RestoreKV = +6.66 [+4.45, +8.84]; - PRGF v4 = +4.75 [+3.06, +6.42];
 - full cache = -6.20 [-7.73, -4.75].
+
+## Round 5: controlled 2x2 ablation (partition mask x region reconstruction), 16 slots, KVzip+
+
+All branches start from the official RestoreKV+ checkpoint (8 slots, expanded identically to 7x2 local + 2
+global = 16 slots), KVzip+ scoring, 1000 steps, lr 1e-4, seed 0. Separate random streams make every branch see
+the same data order, budgets and QA pairs, and C / D the same reconstruction spans and prompts. Full dev (520),
+cr = 0.9375, paired bootstrap:
+
+| | mask | region reconstruction | dev |
+|---|---|---|---|
+| C | causal (full context) | yes | 86.05 |
+| D | PRGF partition | yes | 85.68 |
+| RestoreKV+ (leaderboard) | causal, 8 slots | no | 84.47 |
+
+**D - C = -0.37 [-1.59, +0.89]**: once 16 slots and region reconstruction are controlled, the partition mask adds
+nothing at 16x. C - RestoreKV+ = +1.58; D - RestoreKV+ = +1.22 [-0.66, +3.20]. The gain of the v4 line over
+RestoreKV+ therefore cannot be attributed to the partition mask at this budget; A / B (no reconstruction) and the
+5% budget (where PRGF v1 had its largest gain) are running.
