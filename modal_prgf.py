@@ -345,6 +345,52 @@ def diagnose(ratio: float = 0.9375, tasks: str = "niah_single_2,niah_multivalue,
     print(f"wrote {out}")
 
 
+# ----------------------------------------------------------------------------- sequential job plan (one GPU)
+def train_config(name: str, **kw) -> dict:
+    """Training config with the same defaults as the ``train`` entrypoint (kw: TrainConfig fields)."""
+    plus = kw.get("plus", False)
+    cfg = dict(
+        data_path=f"{RUNS}/data/train.jsonl", output_dir=f"{RUNS}/ckpt/{name}", model=MODEL, max_answer_tokens=256,
+        score_cache_dir=f"{RUNS}/data/{'kvzip_plus_scores' if plus else 'kvzip_scores'}",
+    )
+    cfg.update(kw)
+    return cfg
+
+
+@app.function(image=kv_image, volumes=volumes, timeout=24 * 3600)
+def run_plan_remote(jobs: list[dict]) -> list:
+    """Run train / eval jobs one after the other (server-side: survives client restarts, never two GPUs).
+
+    {"train": name, **TrainConfig fields}  |  {"eval": name, "spec": {...}, "ratios": [...], "split": str}
+    A finished training run (``final`` exists) is skipped, so a plan can be re-submitted after a failure.
+    """
+    import os
+
+    out = []
+    for job in jobs:
+        job = dict(job)
+        if "train" in job:
+            cfg = train_config(job.pop("train"), **job)
+            runs.reload()
+            if not os.path.exists(os.path.join(cfg["output_dir"], "final", "adapter_model.safetensors")):
+                train_remote.remote(cfg)
+            out.append({"trained": cfg["output_dir"]})
+        else:
+            res = evaluate_remote.remote(job["eval"], job["spec"], job.get("ratios", [0.9375]), job["split"], 1)
+            out.append({job["eval"]: res})
+        print(out[-1], flush=True)
+    return out
+
+
+@app.local_entrypoint()
+def run_plan(plan: str):
+    """plan: path to a JSON list of jobs (see run_plan_remote)."""
+    with open(plan) as f:
+        jobs = json.load(f)
+    call = run_plan_remote.spawn(jobs)
+    print(f"spawned {call.object_id}: {len(jobs)} jobs")
+
+
 # ----------------------------------------------------------------------------- server-side queue
 @app.function(image=kv_image, volumes=volumes, timeout=12 * 3600)
 def evaluate_when_ready(ckpt_dir: str, name: str, spec: dict, ratios: list[float], split: str, n_shards: int) -> dict:

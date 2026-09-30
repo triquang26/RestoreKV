@@ -243,3 +243,27 @@ def test_train_evicted_partition(tiny):
     press = PartitionedRestoreKVPress(compression_ratio=0.8, adapter=f"{cfg.output_dir}/final", slots_per_region=2,
                                       num_global=2, partition="evicted")
     pipe(" ".join(f"fact{i}" for i in range(150)), question="What?", press=press, cache=DynamicCache(), max_new_tokens=2)
+
+
+def test_ablation_variants_share_budgets_and_spans(tiny):
+    """Mask / reconstruction variants draw identical budgets, QA pairs and (when regions agree) spans."""
+    root, _ = tiny
+    common = dict(data_path=str(root / "data.jsonl"), model=str(root / "model"), init_adapter=str(root / "adapter"),
+                  slots_per_region=2, num_global=2, recon_span=8, steps=3, warmup_steps=1)
+    logs = {}
+    for name, mode, rw in [("A", "causal", 0.0), ("C", "causal", 1.0), ("D", "prgf", 1.0)]:
+        t = Trainer(TrainConfig(output_dir=str(root / f"abl_{name}"), mask_mode=mode, recon_weight=rw, **common))
+        budgets, spans = [], []
+        orig_batch = t._batch
+
+        def batch(sample, regions=None, t=t, orig=orig_batch):
+            out = orig(sample, regions)
+            budgets.append(round(1 - t.press.compression_ratio, 6))
+            spans.append(out[1][:, :].sum().item())
+            return out
+
+        t._batch = batch
+        t.train()
+        logs[name] = (budgets, spans)
+    assert logs["A"][0] == logs["C"][0] == logs["D"][0]
+    assert logs["C"][1] == logs["D"][1]  # same QA pairs and same reconstruction spans

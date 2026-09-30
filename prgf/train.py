@@ -113,7 +113,10 @@ class Trainer:
     def __init__(self, cfg: TrainConfig):
         self.cfg = cfg
         speedups.enable()
-        self.rng = random.Random(cfg.seed)
+        # Separate streams so that variants of an ablation (mask, reconstruction on/off) see the same data order,
+        # budgets and QA pairs at every step, and the same reconstruction spans whenever their regions agree.
+        self.rng = random.Random(cfg.seed)  # data order, budgets, QA pairs
+        self.recon_rng = random.Random(cfg.seed + 1_000_003)  # reconstruction spans
         torch.manual_seed(cfg.seed)
         self.tok = AutoTokenizer.from_pretrained(cfg.model)
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -208,7 +211,7 @@ class Trainer:
             lo = max(lo, pre + 8)  # skip the chat-template prefix / attention sinks
             if hi - span <= lo:
                 continue
-            start = self.rng.randrange(lo, hi - span)
+            start = self.recon_rng.randrange(lo, hi - span)
             questions.append(self.RECON_QUESTION.format(self.tok.decode(ctx_ids[start - pre : start])))
             answers.append(ctx_ids[start : start + span])
         if not questions:
@@ -329,7 +332,7 @@ class Trainer:
             json.dump(asdict(self.cfg), f, indent=2)
         state = {
             "step": step, "order": order, "optim": self.optim.state_dict(), "sched": self.sched.state_dict(),
-            "rng": self.rng.getstate(), "torch_rng": torch.get_rng_state(),
+            "rng": self.rng.getstate(), "recon_rng": self.recon_rng.getstate(), "torch_rng": torch.get_rng_state(),
             # fp32 master weights: the saved adapter is re-loaded in the model dtype (bf16)
             "fp32_embeddings": self.embeddings.detach().cpu(), "fp32_lora": [p.detach().cpu() for p in self.lora],
         }
@@ -340,6 +343,8 @@ class Trainer:
         self.optim.load_state_dict(state["optim"])
         self.sched.load_state_dict(state["sched"])
         self.rng.setstate(state["rng"])
+        if "recon_rng" in state:
+            self.recon_rng.setstate(state["recon_rng"])
         torch.set_rng_state(state["torch_rng"])
         with torch.no_grad():  # bf16 copies were loaded through the press; restore the fp32 master weights
             self.embeddings.copy_(state["fp32_embeddings"].to(self.embeddings.device))
