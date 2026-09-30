@@ -25,9 +25,10 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from prgf import speedups
 from prgf.data import kvpress_inputs
 from prgf.masking import (
-    MaskMode, Partition, attention_bias, exchange_layer, partition_ids, region_ids, restore_pass_provider,
-    student_pass_provider,
+    MaskMode, Partition, attention_bias, capture_attention, exchange_layer, partition_ids, region_ids,
+    restore_pass_provider, student_pass_provider,
 )
+from prgf.read import read_matching_loss
 from prgf.press import EMBEDDINGS_FILE, PartitionedRestoreKVPress, expand_restore_embeddings
 from prgf.transport import slot_scope, transport_write
 
@@ -56,6 +57,14 @@ class TrainConfig:
     max_grad_norm: float = 1.0
     budget_min: float = 0.025
     budget_max: float = 0.25
+    # with probability budget_point_prob, train at one of these budgets (uniformly) instead of U(min, max)
+    budget_points: tuple[float, ...] = ()
+    budget_point_prob: float = 0.0
+    # read matching (prgf/read.py): weight (linearly warmed up over read_warmup steps), sampled layers / queries
+    read_weight: float = 0.0
+    read_warmup: int = 50
+    read_layers: int = 4
+    read_queries: int = 64
     max_qa_per_step: int = 5
     max_answer_tokens: int = 512
     # Partitioned reconstruction distillation: per step, one evicted-region span per local slot, reproduced
@@ -117,6 +126,8 @@ class Trainer:
         # budgets and QA pairs at every step, and the same reconstruction spans whenever their regions agree.
         self.rng = random.Random(cfg.seed)  # data order, budgets, QA pairs
         self.recon_rng = random.Random(cfg.seed + 1_000_003)  # reconstruction spans
+        self.read_rng = random.Random(cfg.seed + 2_000_003)  # read-matching layers and queries
+        self.step_idx, self.last_read = 0, float("nan")
         torch.manual_seed(cfg.seed)
         self.tok = AutoTokenizer.from_pretrained(cfg.model)
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -239,6 +250,19 @@ class Trainer:
         where = (torch.tensor(rows, device=dev), torch.tensor(cols, device=dev))
         return torch.tensor([ctx_ids], device=dev), ids.to(dev), where, torch.tensor(weights, device=dev)
 
+    def _sample_budget(self) -> float:
+        cfg = self.cfg
+        if cfg.budget_points:
+            u = self.rng.random()
+            if u < cfg.budget_point_prob:
+                return cfg.budget_points[min(int(u / cfg.budget_point_prob * len(cfg.budget_points)), len(cfg.budget_points) - 1)]
+        return self.rng.uniform(cfg.budget_min, cfg.budget_max)
+
+    def _read_layers(self) -> list[int]:
+        if self.cfg.read_weight <= 0:
+            return []
+        return sorted(self.read_rng.sample(range(self.model.config.num_hidden_layers), self.cfg.read_layers))
+
     def _logits(self, qa_ids, cache, start, where):
         pos = torch.arange(start, start + qa_ids.shape[1], device=qa_ids.device)[None].expand(qa_ids.shape[0], -1)
         hidden = self.model.model(input_ids=qa_ids, past_key_values=cache, position_ids=pos).last_hidden_state
@@ -250,7 +274,7 @@ class Trainer:
         ctx_ids = torch.tensor([kvpress_inputs(self.tok, sample["context"], [])[0]], device=model.device)
 
         # 1) prefill + KVzip selection (reserves n*L*H pairs of the budget for the restore slots)
-        self.press.compression_ratio = 1 - self.rng.uniform(self.cfg.budget_min, self.cfg.budget_max)
+        self.press.compression_ratio = 1 - self._sample_budget()
         cache, cached = DynamicCache(), self._load_scores(sample)
         with torch.no_grad():
             if cached is None:
@@ -269,8 +293,9 @@ class Trainer:
         batch = qa_ids.shape[0]
         self.timer.lap("select")
 
-        # 2) teacher over the full cache
-        with torch.no_grad():
+        # 2) teacher over the full cache (optionally recording the queries / QA keys of a few layers)
+        read_layers = self._read_layers()
+        with torch.no_grad(), capture_attention(read_layers) as captured:
             full = _cache_from([(k.expand(batch, -1, -1, -1), v.expand(batch, -1, -1, -1)) for k, v in ctx_kv])
             teacher = self._logits(qa_ids, full, T, where)
             del full
@@ -314,6 +339,13 @@ class Trainer:
             student = self._logits(qa_ids, student_cache, T + n, where)
 
         loss = symmetric_kl(teacher, student, weights)
+        if read_layers:
+            pick = torch.tensor(sorted(self.read_rng.sample(range(len(where[0])), min(self.cfg.read_queries, len(where[0])))),
+                                device=model.device)
+            read = read_matching_loss(captured, kept, slots, where[0][pick], where[1][pick], T)
+            self.last_read = read.item()
+            loss = loss + self.cfg.read_weight * min(1.0, (self.step_idx + 1) / max(self.cfg.read_warmup, 1)) * read
+        self.step_idx += 1
         self.timer.lap("student_fwd")
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_([self.embeddings, *self.lora], self.cfg.max_grad_norm)
@@ -332,7 +364,7 @@ class Trainer:
             json.dump(asdict(self.cfg), f, indent=2)
         state = {
             "step": step, "order": order, "optim": self.optim.state_dict(), "sched": self.sched.state_dict(),
-            "rng": self.rng.getstate(), "recon_rng": self.recon_rng.getstate(), "torch_rng": torch.get_rng_state(),
+            "rng": self.rng.getstate(), "recon_rng": self.recon_rng.getstate(), "read_rng": self.read_rng.getstate(), "step_idx": self.step_idx, "torch_rng": torch.get_rng_state(),
             # fp32 master weights: the saved adapter is re-loaded in the model dtype (bf16)
             "fp32_embeddings": self.embeddings.detach().cpu(), "fp32_lora": [p.detach().cpu() for p in self.lora],
         }
@@ -345,6 +377,9 @@ class Trainer:
         self.rng.setstate(state["rng"])
         if "recon_rng" in state:
             self.recon_rng.setstate(state["recon_rng"])
+        if "read_rng" in state:
+            self.read_rng.setstate(state["read_rng"])
+            self.step_idx = state["step_idx"]
         torch.set_rng_state(state["torch_rng"])
         with torch.no_grad():  # bf16 copies were loaded through the press; restore the fp32 master weights
             self.embeddings.copy_(state["fp32_embeddings"].to(self.embeddings.device))
@@ -366,7 +401,7 @@ class Trainer:
                 rate = (step + 1 - start) / (time.time() - t0)
                 print(
                     f"step {step + 1}/{self.cfg.steps} loss {sum(window) / len(window):.4f} gnorm {gnorm:.3f} "
-                    f"budget {budget:.3f} lr {self.sched.get_last_lr()[0]:.2e} {rate:.2f} it/s | "
+                    f"budget {budget:.3f} read {self.last_read:.4f} lr {self.sched.get_last_lr()[0]:.2e} {rate:.2f} it/s | "
                     f"{self.timer.summary(len(window))}",
                     flush=True,
                 )

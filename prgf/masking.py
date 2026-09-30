@@ -35,6 +35,7 @@ Partition = Literal["position", "evicted"]
 MaskProvider = Callable[[int, int, int], torch.Tensor]
 
 _PROVIDER: ContextVar[MaskProvider | None] = ContextVar("prgf_mask_provider", default=None)
+_CAPTURE: ContextVar[tuple[set[int], dict] | None] = ContextVar("prgf_attention_capture", default=None)
 
 
 @contextmanager
@@ -47,12 +48,26 @@ def attention_bias(provider: MaskProvider):
         _PROVIDER.reset(token)
 
 
+@contextmanager
+def capture_attention(layers):
+    """Record (query, key, value) (post-RoPE, detached; keys/values include the cache) of the given layers."""
+    captured: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+    token = _CAPTURE.set((set(layers), captured))
+    try:
+        yield captured
+    finally:
+        _CAPTURE.reset(token)
+
+
 def _install():
     previous = ALL_ATTENTION_FUNCTIONS["sdpa"]
     if getattr(previous, "_prgf", False):
         return
 
     def sdpa_with_bias(module, query, key, value, attention_mask, *args, **kwargs):
+        capture = _CAPTURE.get()
+        if capture is not None and module.layer_idx in capture[0]:
+            capture[1][module.layer_idx] = (query.detach(), key.detach(), value.detach())
         provider = _PROVIDER.get()
         if provider is None:
             slot_bias = getattr(module, "prgf_slot_bias", None)

@@ -267,3 +267,26 @@ def test_ablation_variants_share_budgets_and_spans(tiny):
         logs[name] = (budgets, spans)
     assert logs["A"][0] == logs["C"][0] == logs["D"][0]
     assert logs["C"][1] == logs["D"][1]  # same QA pairs and same reconstruction spans
+
+
+def test_read_matching_training_keeps_budgets(tiny):
+    """v5 recipe: read matching + budget points; the control (no read loss) sees the same budgets and QA pairs."""
+    root, _ = tiny
+    common = dict(data_path=str(root / "data.jsonl"), model=str(root / "model"), init_adapter=str(root / "adapter"),
+                  slots_per_region=2, num_global=2, steps=4, warmup_steps=1, lr=1e-2,
+                  budget_points=(0.05, 0.0625), budget_point_prob=0.6)
+    budgets = {}
+    for name, rw in [("ctrl", 0.0), ("read", 1.0)]:
+        t = Trainer(TrainConfig(output_dir=str(root / f"v5_{name}"), read_weight=rw, read_layers=1, read_warmup=1, **common))
+        seen, orig = [], t._batch
+
+        def batch(sample, regions=None, t=t, orig=orig, seen=seen):
+            seen.append(round(1 - t.press.compression_ratio, 6))
+            return orig(sample, regions)
+
+        t._batch = batch
+        t.train()
+        budgets[name] = seen
+        if rw:
+            assert t.last_read == t.last_read and t.last_read >= 0  # computed (not NaN)
+    assert budgets["ctrl"] == budgets["read"]
