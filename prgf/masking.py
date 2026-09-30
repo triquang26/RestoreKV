@@ -31,6 +31,7 @@ from transformers.integrations.sdpa_attention import sdpa_attention_forward
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 MaskMode = Literal["prgf", "causal"]
+Partition = Literal["position", "evicted"]
 MaskProvider = Callable[[int, int, int], torch.Tensor]
 
 _PROVIDER: ContextVar[MaskProvider | None] = ContextVar("prgf_mask_provider", default=None)
@@ -99,8 +100,30 @@ def region_ids(context_length: int, num_regions: int, device=None) -> torch.Tens
     return torch.arange(context_length, device=device) * num_regions // context_length
 
 
+def evicted_region_ids(kept: torch.Tensor, num_regions: int) -> torch.Tensor:
+    """Contiguous regions holding equal shares of the evicted KV pairs (counted over all leading dims, e.g.
+    layers and heads): with e_t evicted pairs at position t and F(t) = sum_{u<t} e_u, P_j = {t : floor(R F(t) /
+    F(T)) = j}. One partition per context, shared by every layer and head; depends only on the selection."""
+    context_length = kept.shape[-1]
+    evicted = (~kept).reshape(-1, context_length).sum(0).double()
+    total = evicted.sum()
+    if total == 0:
+        return region_ids(context_length, num_regions, kept.device)
+    before = evicted.cumsum(0) - evicted
+    return (before * num_regions / total).floor().long().clamp_(max=num_regions - 1)
+
+
+def partition_ids(kept: torch.Tensor, num_regions: int, partition: Partition = "position") -> torch.Tensor:
+    if partition == "position":
+        return region_ids(kept.shape[-1], num_regions, kept.device)
+    if partition == "evicted":
+        return evicted_region_ids(kept, num_regions)
+    raise ValueError(f"Unknown partition {partition!r}")
+
+
 def restore_allowed(
-    kept: torch.Tensor, num_restore: int, mode: MaskMode = "prgf", slots_per_region: int = 1, num_global: int = 1
+    kept: torch.Tensor, num_restore: int, mode: MaskMode = "prgf", slots_per_region: int = 1, num_global: int = 1,
+    partition: Partition = "position",
 ) -> torch.Tensor:
     """Allowed-attention pattern of the restore tokens.
 
@@ -118,7 +141,7 @@ def restore_allowed(
         n_local = n - num_global
         assert num_global >= 1 and n_local >= slots_per_region and n_local % slots_per_region == 0, (n, slots_per_region, num_global)
         slot_region = torch.arange(n_local, device=device) // slots_per_region
-        regions = region_ids(context_length, n_local // slots_per_region, device)
+        regions = partition_ids(kept, n_local // slots_per_region, partition)
         own_region = regions[None, :] == slot_region[:, None]  # (n_local, T)
         ctx[..., :n_local, :] = kept[..., None, :] | own_region
         slots[:n_local, :n_local] &= slot_region[:, None] == slot_region[None, :]  # chains stay inside a region
@@ -149,7 +172,7 @@ def exchange_layer(num_layers: int, exchange_from: float | None) -> int | None:
 
 def restore_pass_provider(
     kept: torch.Tensor, num_restore: int, num_groups: int, mode: MaskMode, exchange_from_layer: int | None = None,
-    slots_per_region: int = 1, num_global: int = 1,
+    slots_per_region: int = 1, num_global: int = 1, partition: Partition = "position",
 ) -> MaskProvider:
     """kept: (num_layers, num_kv_heads, T) bool. Masks of all layers are built at once (a few kernels).
 
@@ -158,7 +181,7 @@ def restore_pass_provider(
     from the context only (before any question), and Q/K/V of a layer come from that layer's inputs.
     """
     context_length = kept.shape[-1]
-    allowed = restore_allowed(kept, num_restore, mode, slots_per_region, num_global)  # (L, H_kv, n, T + n)
+    allowed = restore_allowed(kept, num_restore, mode, slots_per_region, num_global, partition)  # (L, H_kv, n, T + n)
     if exchange_from_layer is not None:
         assert mode == "prgf", "local-global exchange extends the PRGF mask"
         n_local = num_restore - num_global

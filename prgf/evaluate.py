@@ -4,7 +4,8 @@ Protocol (identical for every method):
   * dataset ``simonjegou/ruler`` / 4096, the one used by the KVPress leaderboard;
   * fixed split: ``dev`` = first ``DEV_PER_TASK`` rows of each task after a seeded shuffle (used for
     iterating), ``test`` = the remaining rows (only used for final numbers), ``test:K`` / ``dev:K`` = the
-    first K rows of each task of that split (same shuffle; cheaper screening sets), ``all`` = everything;
+    first K rows of each task of that split (same shuffle; cheaper screening sets), ``test:a-b`` = rows
+    [a, b) of each task (e.g. the second half of test:50), ``all`` = everything;
   * rows grouped by context and answered by ``pipe(context, questions=..., answer_prefix=...)`` exactly as
     kvpress/evaluation/evaluate.py does; greedy decoding with the task's max_new_tokens;
   * SDPA attention and bf16 for all methods; score = kvpress' RULER string-match metric, averaged over tasks.
@@ -32,12 +33,13 @@ def load_ruler(split: str) -> pd.DataFrame:
     split, _, tasks = split.partition("@")  # e.g. "test:50@niah_single_2,niah_multivalue" (filter AFTER splitting)
     split, _, per_task = split.partition(":")
     assert split in ("dev", "test"), split
-    k = int(per_task) if per_task else None
+    lo, _, hi = per_task.rpartition("-")  # "K" -> rows [0, K); "a-b" -> rows [a, b) of each task
+    lo, hi = int(lo or 0), int(hi) if hi else None
     rng = np.random.default_rng(SPLIT_SEED)
     rows = []
     for _, g in df.groupby("task", sort=True):
         order = rng.permutation(g.index.to_numpy())
-        rows += list((order[:DEV_PER_TASK] if split == "dev" else order[DEV_PER_TASK:])[:k])
+        rows += list((order[:DEV_PER_TASK] if split == "dev" else order[DEV_PER_TASK:])[lo:hi])
     out = df.loc[sorted(rows)]
     return out[out["task"].isin(tasks.split(","))] if tasks else out
 
@@ -61,7 +63,7 @@ def make_press(spec: dict, compression_ratio: float):
         compression_ratio=compression_ratio, kvzip_plus_normalization=plus, adapter=spec.get("adapter"), mask_mode=mode,
         exchange_from=spec.get("exchange_from"), drop_slots_at_decode=spec.get("drop_slots_at_decode", False),
         slots_per_region=spec.get("slots_per_region", 1), num_global=spec.get("num_global", 1),
-        transport=spec.get("transport", False), query_moment=spec.get("query_moment"),
+        partition=spec.get("partition", "position"), transport=spec.get("transport", False), query_moment=spec.get("query_moment"),
         transport_iters=spec.get("transport_iters", 2), transport_tau=spec.get("transport_tau", 0.1),
         transport_lambda_v=spec.get("transport_lambda_v", 1.0), transport_mass_scale=spec.get("transport_mass_scale", 1.0),
         **extra,

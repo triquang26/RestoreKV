@@ -10,7 +10,7 @@ from kvpress import KVzipPress, RestoreKVPress
 from safetensors.torch import load_file
 from transformers import PreTrainedModel
 
-from prgf.masking import MaskMode, attention_bias, exchange_layer, restore_pass_provider
+from prgf.masking import MaskMode, Partition, attention_bias, exchange_layer, restore_pass_provider
 from prgf.transport import TransportConfig, slot_scope, transport_write
 
 EMBEDDINGS_FILE = "restore_embeddings.safetensors"
@@ -96,6 +96,8 @@ class PartitionedRestoreKVPress(RestoreKVPress):
         PRGF v2: from layer floor(exchange_from * L) on, local slots also read the global slots.
     slots_per_region, num_global : int
         Slot layout: k chained local slots per region and g global slots (v1: k = g = 1).
+    partition : {"position", "evicted"}
+        Regions of equal length, or of equal evicted KV mass (``masking.evicted_region_ids``).
     selection_only : bool
         Stop after eviction selection and expose ``kept_mask`` (used by the trainer).
     """
@@ -105,6 +107,7 @@ class PartitionedRestoreKVPress(RestoreKVPress):
     exchange_from: float | None = None
     slots_per_region: int = 1
     num_global: int = 1
+    partition: Partition = "position"
     transport: bool = False  # write the slots by conserving transport of the evicted KV (see prgf/transport.py)
     transport_iters: int = 2
     transport_tau: float = 0.1
@@ -214,6 +217,7 @@ class PartitionedRestoreKVPress(RestoreKVPress):
         provider = restore_pass_provider(
             self.kept_mask, self.num_restore_tokens, num_groups, self.mask_mode,
             exchange_layer(model.config.num_hidden_layers, self.exchange_from), self.slots_per_region, self.num_global,
+            self.partition,
         )
         with attention_bias(provider):
             super().append_restore_tokens(model)

@@ -219,3 +219,27 @@ def test_query_second_moment_is_psd(tiny):
     assert G.shape == (cfg.num_hidden_layers, cfg.num_key_value_heads, cfg.head_dim, cfg.head_dim)
     torch.testing.assert_close(G, G.transpose(-1, -2))
     assert (torch.linalg.eigvalsh(G) > -1e-5).all()
+
+
+def test_train_evicted_partition(tiny):
+    """Eviction-mass regions: reconstruction spans lie inside the selection-dependent regions; saved adapter
+    loads through the press with the same partition."""
+    from prgf.masking import partition_ids
+
+    root, tok = tiny
+    cfg = TrainConfig(data_path=str(root / "data.jsonl"), output_dir=str(root / "out_evict"), model=str(root / "model"),
+                      init_adapter=str(root / "adapter"), slots_per_region=2, num_global=2, partition="evicted",
+                      recon_weight=1.0, recon_span=8, steps=2, warmup_steps=1)
+    trainer = Trainer(cfg)
+    kept = torch.rand(2, 2, 300) < torch.linspace(0.9, 0.1, 300)
+    regions = partition_ids(kept, trainer.num_regions, "evicted").tolist()
+    ctx = list(range(1000, 1300))
+    for j, (_, a) in enumerate(trainer._recon_pairs(ctx, regions)):
+        start = ctx.index(a[0])
+        assert {regions[i] for i in range(start, start + len(a))} == {j}
+    trainer.train()
+    model = Qwen3ForCausalLM.from_pretrained(root / "model", attn_implementation="sdpa")
+    pipe = pipeline("kv-press-text-generation", model=model, tokenizer=tok, device="cpu")
+    press = PartitionedRestoreKVPress(compression_ratio=0.8, adapter=f"{cfg.output_dir}/final", slots_per_region=2,
+                                      num_global=2, partition="evicted")
+    pipe(" ".join(f"fact{i}" for i in range(150)), question="What?", press=press, cache=DynamicCache(), max_new_tokens=2)

@@ -123,13 +123,13 @@ def train(
     seed: int = 0, init_adapter: str = "", exchange_from: float = -1.0, warmup_steps: int = 50, save_every: int = 500,
     recon_weight: float = 0.0, recon_span: int = 64, slots_per_region: int = 1, num_global: int = 1,
     transport: bool = False, transport_tau: float = 0.1, transport_lambda_v: float = 1.0, query_moment: str = "",
-    plus: bool = False,
+    plus: bool = False, partition: str = "position",
 ):
     cfg = dict(
         data_path=f"{RUNS}/data/train.jsonl", output_dir=f"{RUNS}/ckpt/{name}", model=MODEL,
         mask_mode=mask_mode, steps=steps, lr=lr, max_answer_tokens=max_answer_tokens, seed=seed,
         init_adapter=init_adapter or None, exchange_from=exchange_from if exchange_from >= 0 else None,
-        warmup_steps=warmup_steps, save_every=save_every, plus=plus,
+        warmup_steps=warmup_steps, save_every=save_every, plus=plus, partition=partition,
         score_cache_dir=f"{RUNS}/data/{'kvzip_plus_scores' if plus else 'kvzip_scores'}",
         recon_weight=recon_weight, recon_span=recon_span, slots_per_region=slots_per_region, num_global=num_global,
         transport=transport, transport_tau=transport_tau, transport_lambda_v=transport_lambda_v,

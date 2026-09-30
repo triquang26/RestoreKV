@@ -262,3 +262,24 @@ def test_expand_embeddings_keeps_first_copies():
     assert out.shape == (7 * 3 + 2, 16)
     assert torch.equal(out[0::3][:7], emb[:7]) and torch.equal(out[21], emb[7])
     assert not torch.equal(out[1], emb[0]) and torch.allclose(out[1], emb[0], atol=0.1)
+
+
+def test_evicted_partition_balances_evicted_mass():
+    from prgf.masking import evicted_region_ids, partition_ids
+
+    torch.manual_seed(0)
+    L, H, T, R = 3, 2, 400, 7
+    kept = torch.rand(L, H, T) < torch.linspace(0.9, 0.05, T)  # eviction grows toward the end of the context
+    ids = evicted_region_ids(kept, R)
+    assert ids.shape == (T,) and (ids.diff() >= 0).all() and set(ids.tolist()) == set(range(R))  # contiguous
+    per_region = torch.zeros(R).index_add_(0, ids, (~kept).sum((0, 1)).float())
+    assert per_region.max() - per_region.min() <= 2 * L * H  # equal shares up to one position's worth
+    lengths = torch.bincount(ids, minlength=R)
+    assert lengths[0] > lengths[-1]  # later regions are shorter where more is evicted
+    assert torch.equal(partition_ids(torch.ones(L, H, T, dtype=torch.bool), R, "evicted"), region_ids(T, R))  # nothing evicted
+    # the restore mask uses the same regions for every layer and head
+    allowed = restore_allowed(kept, 2 * R + 2, "prgf", slots_per_region=2, num_global=2, partition="evicted")
+    for j in range(R):
+        own = ids == j
+        assert allowed[..., 2 * j, :T][..., own].all() and allowed[..., 2 * j + 1, :T][..., own].all()
+        assert torch.equal(allowed[..., 2 * j, :T][..., ~own], kept[..., ~own])

@@ -25,7 +25,8 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from prgf import speedups
 from prgf.data import kvpress_inputs
 from prgf.masking import (
-    MaskMode, attention_bias, exchange_layer, region_ids, restore_pass_provider, student_pass_provider,
+    MaskMode, Partition, attention_bias, exchange_layer, partition_ids, region_ids, restore_pass_provider,
+    student_pass_provider,
 )
 from prgf.press import EMBEDDINGS_FILE, PartitionedRestoreKVPress, expand_restore_embeddings
 from prgf.transport import slot_scope, transport_write
@@ -42,6 +43,7 @@ class TrainConfig:
     exchange_from: float | None = None  # PRGF v2: local slots read G from layer floor(exchange_from * L)
     slots_per_region: int = 1  # k chained local slots per region (v1 checkpoints are expanded on load)
     num_global: int = 1
+    partition: Partition = "position"  # regions of equal length, or of equal evicted KV mass (after selection)
     transport: bool = False  # transport-written slots (prgf/transport.py); gradients flow through the rounds
     transport_iters: int = 2
     transport_tau: float = 0.1
@@ -138,7 +140,7 @@ class Trainer:
         if (k, g) != (1, 1) and embeddings.shape[0] == 8 and cfg.resume_from is None:  # start from a v1 layout
             embeddings = expand_restore_embeddings(embeddings, k, g)
         self.press.restore_embeddings = embeddings.to(self.model.dtype)  # budget matching pays for every slot
-        self.press.slots_per_region, self.press.num_global = k, g
+        self.press.slots_per_region, self.press.num_global, self.press.partition = k, g, cfg.partition
         self.press.transport, self.press.query_moment = cfg.transport, cfg.query_moment
         self.press.transport_iters, self.press.transport_tau = cfg.transport_iters, cfg.transport_tau
         self.press.transport_lambda_v = cfg.transport_lambda_v
@@ -195,11 +197,11 @@ class Trainer:
 
     RECON_QUESTION = "Repeat the part of the previous context exactly, starting with: {}"
 
-    def _recon_pairs(self, ctx_ids: list[int]) -> list[tuple[list[int], list[int]]]:
+    def _recon_pairs(self, ctx_ids: list[int], regions: list[int] | None = None) -> list[tuple[list[int], list[int]]]:
         """One (question, span) pair per region: the span lies inside region j, whose evicted part only the
         local slots of region j can read, so its reconstruction error is attributable to them."""
         T, n_local, span, pre = len(ctx_ids), self.num_regions, self.cfg.recon_span, self.cfg.recon_prefix
-        regions = region_ids(T, n_local).tolist()
+        regions = region_ids(T, n_local).tolist() if regions is None else regions
         questions, answers = [], []
         for j in range(n_local):
             lo, hi = regions.index(j), T - regions[::-1].index(j)
@@ -214,11 +216,11 @@ class Trainer:
         _, q_ids = kvpress_inputs(self.tok, "", questions)
         return list(zip(q_ids, answers))
 
-    def _batch(self, sample):
+    def _batch(self, sample, regions: list[int] | None = None):
         ctx_ids, q_ids = kvpress_inputs(self.tok, sample["context"], sample["questions"])
         pairs = [(q, a[: self.cfg.max_answer_tokens]) for q, a in zip(q_ids, sample["answer_ids"]) if a]
         pairs = self.rng.sample(pairs, min(len(pairs), self.cfg.max_qa_per_step))
-        recon = self._recon_pairs(ctx_ids) if self.cfg.recon_weight > 0 else []
+        recon = self._recon_pairs(ctx_ids, regions) if self.cfg.recon_weight > 0 else []
         n_qa, n_rec = sum(len(a) for _, a in pairs), sum(len(a) for _, a in recon)
         length = max(len(q) + len(a) for q, a in pairs + recon)
         pad = self.tok.pad_token_id or 0
@@ -242,8 +244,7 @@ class Trainer:
     def step(self, sample):
         model, n = self.model, self.num_restore
         self.timer.start()
-        ctx_ids, qa_ids, where, weights = self._batch(sample)
-        batch = qa_ids.shape[0]
+        ctx_ids = torch.tensor([kvpress_inputs(self.tok, sample["context"], [])[0]], device=model.device)
 
         # 1) prefill + KVzip selection (reserves n*L*H pairs of the budget for the restore slots)
         self.press.compression_ratio = 1 - self.rng.uniform(self.cfg.budget_min, self.cfg.budget_max)
@@ -259,6 +260,10 @@ class Trainer:
                 kept = self.press.select_from_scores(model, cached)
         T = ctx_ids.shape[1]
         ctx_kv = [(layer.keys, layer.values) for layer in cache.layers]
+        # reconstruction spans follow the regions of the restore mask, which may depend on the selection
+        regions = None if self.cfg.partition == "position" else partition_ids(kept, self.num_regions, self.cfg.partition).tolist()
+        _, qa_ids, where, weights = self._batch(sample, regions)
+        batch = qa_ids.shape[0]
         self.timer.lap("select")
 
         # 2) teacher over the full cache
@@ -276,7 +281,7 @@ class Trainer:
             provider = restore_pass_provider(
                 kept, n, self.num_groups, self.cfg.mask_mode,
                 exchange_layer(model.config.num_hidden_layers, self.cfg.exchange_from),
-                self.cfg.slots_per_region, self.cfg.num_global,
+                self.cfg.slots_per_region, self.cfg.num_global, self.cfg.partition,
             )
             with attention_bias(provider):
                 model.model(
