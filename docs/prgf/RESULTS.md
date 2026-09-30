@@ -172,4 +172,19 @@ scorer; KVzip+ costs multikey_1 for both restore models (95 -> 80 here, 80 -> 75
 
 Fine-tuning v4 step 1000 on KVzip+ selections (600 steps, lr 5e-5, recon_weight 1, same 16-slot layout):
 v4+ - RestoreKV+ = +3.63 [+1.28, +6.19]; - PRGF v4 (KVzip) = +4.41 [+2.26, +6.47]; - zero-shot = +0.37 [-0.92, +1.68]
-(adaptation to the new selection is within noise; the scorer swap carries the gain). Held-out test:50 pending.
+(adaptation to the new selection is within noise; the scorer swap carries the gain).
+
+Held-out **test:25** (first 25 test rows per task, 325 samples, a subset of test:50; the credit left covered only
+this half), paired against the leaderboard predictions on the same rows:
+
+| | average | cwe | fwe | multikey_1 | multivalue | single_2 | single_3 | qa_1 | qa_2 |
+|---|---|---|---|---|---|---|---|---|---|
+| full cache | 96.64 | 97.6 | 94.7 | 100 | 100 | 100 | 100 | 88 | 76 |
+| RestoreKV | 83.78 | 44.8 | 81.3 | 92 | 78.0 | 80 | 92 | 76 | 52 |
+| RestoreKV+ | 85.50 | 81.2 | 81.3 | 76 | 80.0 | 84 | 88 | 80 | 48 |
+| PRGF v4 (KVzip) | 85.82 | 46.0 | 82.7 | 96 | 77.0 | 80 | 96 | 80 | 60 |
+| **PRGF v4+ (KVzip+)** | **90.39** | 76.4 | 86.7 | 100 | 87.0 | 96 | 92 | 84 | 60 |
+
+v4+ - RestoreKV+ = +4.89 [+2.26, +7.79]; - RestoreKV = +6.61 [+3.55, +9.79]; - PRGF v4 = +4.57 [+2.36, +6.85];
+- full cache = -6.25 [-8.37, -4.29]. These rows are slightly easier than the full test:50 (PRGF v4: 85.82 here vs
+85.12 on test:50), so the test:50 number is expected around 89.5-90; it still has to be measured.
