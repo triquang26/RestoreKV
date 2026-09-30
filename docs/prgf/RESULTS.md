@@ -230,3 +230,15 @@ Same two checkpoints at **cr = 0.95 (5% budget, 20x)**, full dev:
 budget-dependent: none at 16x, large at 20x, consistent with PRGF v1 (KVzip, 8 slots), whose gain over RestoreKV
 was +0.9 at 10%, +1.3 at 6.25% and +4.2 at 5%. With little kept context, unrestricted slots degrade (C loses
 10.4 points from 16x to 20x) while partitioned slots keep most of their accuracy (D loses 3.5).
+
+B (partition mask, no reconstruction), same init and schedule:
+
+| | mask | recon | 16x | 20x |
+|---|---|---|---|---|
+| B | partition | no | 85.78 | 81.11 |
+| C | causal | yes | 86.05 | 75.65 |
+| D | partition | yes | 85.68 | 82.15 |
+
+D - B (reconstruction, given the partition): -0.09 [-1.61, +1.51] at 16x, +1.06 [-0.55, +2.77] at 20x.
+B - C: -0.27 [-1.81, +1.25] at 16x, **+5.45 [+3.52, +7.53]** at 20x. At 20x the partition mask carries the effect,
+region reconstruction adds at most about one point (not significant). A (causal, no reconstruction) pending.
