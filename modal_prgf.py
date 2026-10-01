@@ -160,16 +160,30 @@ class Evaluator:
         self.data = {}
 
     @modal.method()
-    def run(self, spec: dict, ratio: float, split: str, shard: int, n_shards: int) -> dict:
+    def run(self, spec: dict, ratio: float, split: str, shard: int, n_shards: int, cache_path: str | None = None) -> dict:
+        """One shard of an evaluation; with ``cache_path`` the result is persisted on the volume and reused, so a
+        preempted evaluation only redoes the shards that had not finished."""
+        import os
+
         from prgf.evaluate import load_ruler, make_press, run_rows
 
         runs.reload()
+        if cache_path and os.path.exists(cache_path):
+            with open(cache_path) as f:
+                return json.load(f)
         if split not in self.data:
             self.data[split] = load_ruler(split)
         df = self.data[split]
         contexts = df["context"].unique()[shard::n_shards]
         preds, seconds = run_rows(self.pipe, make_press(spec, ratio), df[df["context"].isin(contexts)])
-        return {"preds": preds.to_dict(), "seconds": seconds}
+        out = {"preds": {str(k): v for k, v in preds.to_dict().items()}, "seconds": seconds}
+        if cache_path:
+            os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+            with open(cache_path + ".tmp", "w") as f:
+                json.dump(out, f)
+            os.replace(cache_path + ".tmp", cache_path)
+            runs.commit()
+        return out
 
 
     @modal.method()
@@ -188,7 +202,8 @@ def evaluate_remote(name: str, spec: dict, ratios: list[float], split: str, n_sh
     from prgf.evaluate import load_ruler, score
 
     df = load_ruler(split)
-    jobs = [(spec, r, split, s, n_shards) for r in ratios for s in range(n_shards)]
+    shard_dir = f"{RUNS}/results/{name}/{split}/shards"
+    jobs = [(spec, r, split, s, n_shards, f"{shard_dir}/{r}_{s}of{n_shards}.json") for r in ratios for s in range(n_shards)]
     outs = list(Evaluator().run.starmap(jobs))
     summary = {}
     for i, r in enumerate(ratios):
