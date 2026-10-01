@@ -249,3 +249,18 @@ The official RestoreKV+ press run in our pipeline (SDPA, PEFT checkpoint `higokr
 against the leaderboard predictions (FlashAttention-2, original checkpoint) on the same 650 rows:
 86.33 vs 86.33, **difference +0.00 [-1.12, +1.20]**. Backend and checkpoint format do not move the score, so the
 comparison with the leaderboard is like-for-like: PRGF v4+ - RestoreKV+ (both in our pipeline) = +3.53 [+1.91, +5.24].
+
+### Complete 2x2 at 20x (cr = 0.95, full dev)
+
+| | causal mask | partition mask |
+|---|---|---|
+| no region reconstruction | A 71.61 | B 81.11 |
+| region reconstruction | C 75.65 | D 82.15 |
+
+Partition effect: B - A = **+9.50 [+7.19, +11.75]** without reconstruction, D - C = **+6.51 [+4.40, +8.75]** with it.
+Reconstruction effect: C - A = +4.04 [+2.04, +6.05] with the causal mask, D - B = +1.06 [-0.55, +2.77] with the
+partition. The partition mask is the main factor at high compression; region reconstruction helps unrestricted slots
+but adds little once the slots are partitioned (the two address the same failure). At 16x all four variants are within
+noise of each other (85.7-86.1 for B, C, D).
+
+PRGF v4+ on full dev: 88.17 at 16x (- RestoreKV+ = +3.71 [+1.77, +5.76]); 82.02 at 20x (- D = -0.13 [-2.01, +1.71]).
