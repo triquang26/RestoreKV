@@ -264,3 +264,44 @@ but adds little once the slots are partitioned (the two address the same failure
 noise of each other (85.7-86.1 for B, C, D).
 
 PRGF v4+ on full dev: 88.17 at 16x (- RestoreKV+ = +3.71 [+1.77, +5.76]); 82.02 at 20x (- D = -0.13 [-2.01, +1.71]).
+
+## Official KVPress protocol: all 6500 RULER-4K rows, Qwen3-8B, cr = 0.9375 (16x), query-agnostic
+
+PRGF v4+ (dev 520 + test:50 650 + test:50-460 5330 = every row of `simonjegou/ruler` / 4096), paired against the
+leaderboard's per-sample predictions on the same rows. Our recomputed baseline averages equal the published ones
+(RestoreKV 81.93, RestoreKV+ 86.38, full cache 95.32), so the rows and scorer are identical.
+
+| task | RestoreKV | RestoreKV+ | **PRGF v4+** | full cache |
+|---|---|---|---|---|
+| cwe | 45.08 | 78.88 | 74.38 | 98.94 |
+| fwe | 79.93 | 83.67 | 87.73 | 95.27 |
+| niah_multikey_1 | 90.40 | 85.80 | 94.60 | 100 |
+| niah_multikey_2 | 99.40 | 99.60 | 100 | 100 |
+| niah_multikey_3 | 97.40 | 97.00 | 99.60 | 100 |
+| niah_multiquery | 95.30 | 96.80 | 96.90 | 99.90 |
+| niah_multivalue | 74.35 | 82.75 | 86.20 | 100 |
+| niah_single_1 | 100 | 100 | 100 | 100 |
+| niah_single_2 | 81.00 | 90.80 | 96.40 | 100 |
+| niah_single_3 | 92.40 | 93.00 | 95.60 | 100 |
+| qa_1 | 63.00 | 65.40 | 70.20 | 81.60 |
+| qa_2 | 46.80 | 49.20 | 52.60 | 63.40 |
+| vt | 100 | 100 | 99.88 | 100 |
+| **average** | 81.93 | 86.38 | **88.78** | 95.32 |
+
+PRGF v4+ - RestoreKV+ = **+2.40 [+1.86, +2.95]**; - RestoreKV = +6.85 [+6.21, +7.48]; - full cache = -6.54.
+(Our SDPA pipeline reproduces RestoreKV+ exactly on test:50, see the backend control above.)
+
+## v5 pilot: read matching (negative)
+
+From v4+, 300 steps, lr 1e-5, KVzip+, budgets 30% at 5% / 30% at 6.25% / 40% U(2.5%, 25%), no reconstruction;
+control = same recipe without the read loss (lambda = 1, 4 layers x 64 teacher queries per step). dev:20, paired:
+
+| | 16x | 20x |
+|---|---|---|
+| v4+ | 87.65 | 82.53 |
+| control (QA distillation) | 87.58 | 82.91 |
+| + read matching | 87.19 | 81.44 |
+| read - control | -0.38 [-1.44, +0.43] | -1.47 [-3.09, +0.01] |
+
+Read matching does not improve QA accuracy (slightly worse at 20x); per the pre-registered rule the run is not extended.
+The control matches v4+, so the extra steps and the budget schedule alone change nothing either.
