@@ -305,3 +305,30 @@ control = same recipe without the read loss (lambda = 1, 4 layers x 64 teacher q
 
 Read matching does not improve QA accuracy (slightly worse at 20x); per the pre-registered rule the run is not extended.
 The control matches v4+, so the extra steps and the budget schedule alone change nothing either.
+
+## Official protocol at 20x: all 6500 rows, cr = 0.95
+
+The leaderboard publishes predictions only at 16x, so RestoreKV+ (official press and checkpoint) was run in our
+pipeline, which reproduces its leaderboard score exactly at 16x (backend control above). Both methods on every row
+of RULER-4K, paired:
+
+| task | RestoreKV+ | **PRGF v4+** | full cache |
+|---|---|---|---|
+| cwe | 59.80 | 57.94 | 98.94 |
+| fwe | 75.07 | 84.07 | 95.27 |
+| niah_multikey_1 | 73.00 | 88.00 | 100 |
+| niah_multikey_2 | 96.20 | 99.20 | 100 |
+| niah_multikey_3 | 86.40 | 98.60 | 100 |
+| niah_multiquery | 89.25 | 93.25 | 99.90 |
+| niah_multivalue | 74.75 | 77.85 | 100 |
+| niah_single_1 | 100 | 100 | 100 |
+| niah_single_2 | 76.00 | 85.40 | 100 |
+| niah_single_3 | 80.20 | 84.40 | 100 |
+| qa_1 | 61.40 | 65.60 | 81.60 |
+| qa_2 | 43.60 | 46.20 | 63.40 |
+| vt | 100 | 99.92 | 100 |
+| **average** | 78.13 | **83.11** | 95.32 |
+
+PRGF v4+ - RestoreKV+ = **+4.98 [+4.28, +5.64]** at 20x, vs +2.40 [+1.86, +2.95] at 16x: the advantage doubles as the
+budget shrinks, consistent with the controlled ablation (partition mask +6.5 / +9.5 at 20x, none at 16x).
+RestoreKV+ loses 8.25 points from 16x to 20x, PRGF v4+ 5.67.
